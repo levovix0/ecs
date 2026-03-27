@@ -1,0 +1,12 @@
+[package]
+name = "ecs"
+version = "0.1.0"
+license = "MIT"
+kind = "Library"
+backend = "C"
+binaries = []
+
+[toolchain]
+version = "2.2.4"
+
+[dependencies]
