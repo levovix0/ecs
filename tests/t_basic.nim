@@ -4,7 +4,7 @@ import ecs
 
 declare_ecs_system print()
 declare_ecs_system print(prefix: string)
-declare_ecs_system count(result: int)
+declare_ecs_system count(): int
 
 
 test "basic ecs":
@@ -91,12 +91,11 @@ test "basic ecs":
 
 
   # systems with names
-  ecs_system print().WorldEntity, (this: WorldEntity):
+  ecs_system print(), (this: WorldEntity).WorldEntity:
     echo this
 
-  ecs_system print().belts, (this: Arrow):
+  ecs_system print(), (this: Arrow).arrows:
     before WorldEntity
-  do:
     echo this
 
   echo "\nw.print()"
@@ -104,17 +103,15 @@ test "basic ecs":
 
 
   # systems without names and with result
-  ecs_system count(result: int), (WorldEntity): inc result
-  ecs_system count(result: int), (Arrow): inc result
-  ecs_system count(result: int), (id: EntityId):
+  ecs_system count(), (WorldEntity): inc result
+  ecs_system count(), (Arrow): inc result
+  ecs_system count():
     before (WorldEntity)
     after (Arrow)
-  do():
-    echo "once, befory cycle"
-  do:
-    inc result
-    echo id.int, " in cycle"
-  do():
+    echo "once, before cycle"
+    w.forEach (id: EntityId):
+      inc result
+      echo id.int, " in cycle"
     echo "once, after cycle"
 
   echo "\nw.count()"
@@ -127,7 +124,6 @@ test "basic ecs":
 
   ecs_system print(prefix: string):
     echo "system without archetype"
-  
 
   echo "\nw.print(\"print(prefix: string): \")"
   w.print("print(prefix: string): ")

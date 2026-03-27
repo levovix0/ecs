@@ -47,7 +47,6 @@ type
 
   SystemDef*[Run] = object
     name*: string
-    archetype*: Archetype
     before*: seq[string]
     after*: seq[string]
     run*: Run
@@ -875,7 +874,7 @@ template removeComponentIf*(w: var World, comp, cond) =
 # ===============
 
 proc resolveSystemOrder[Run](defs: seq[Run]): seq[pointer] =
-  ## Stable topological order for systems with before/after constraints.
+  ## stable topological order for systems with before/after constraints
   let n = defs.len
   var orderIdxs: seq[int]
   if n == 0:
@@ -928,416 +927,179 @@ proc resolveSystemOrder[Run](defs: seq[Run]): seq[pointer] =
     result[i] = cast[pointer](defs[idx].run)
 
 
-proc sigKeyFor(
-  funcNameStr: string,
-  params: seq[tuple[name: string, typ: NimNode, defaultVal: NimNode]],
-  resultType: NimNode
-): string =
-    var parts: seq[string]
-    for p in params:
-      parts.add p.typ.repr
-    let res = if resultType.kind == nnkEmpty: "void" else: resultType.repr
-    funcNameStr & ":" & parts.join(",") & ":" & res
+proc formalParamsFromSignature(signature: NimNode, rettype: NimNode): NimNode =
+  result = nnkFormalParams.newTree(rettype)
+  signature.expectKind {nnkCall, nnkObjConstr}
 
-
-macro declare_ecs_system*(declaration: untyped) =
-  # todo: refactor this
-  proc getFuncNameAndArgs(n: NimNode): tuple[name: NimNode, params: seq[NimNode]] =
-    case n.kind
-    of nnkCall, nnkCommand, nnkObjConstr:
-      (n[0], n[1..^1])
-    of nnkIdent, nnkSym:
-      (n, @[])
+  for x in signature[1..^1]:
+    # argname: argtype == argdefaultvalue
+    if x.kind == nnkExprColonExpr and x.len == 2 and x[1].kind == nnkInfix and x[1].len == 3 and x[1][0].eqIdent("=="):
+      result.add nnkIdentDefs.newTree(x[0], x[1][1], x[1][2])
+    
+    # argname: argtype
+    elif x.kind == nnkExprColonExpr and x.len == 2:
+      result.add nnkIdentDefs.newTree(x[0], x[1], newEmptyNode())
+    
+    # argname == argdefaultvalue
+    elif x.kind == nnkInfix and x.len == 3 and x[0].eqIdent("=="):
+      result.add nnkIdentDefs.newTree(x[1], newEmptyNode(), x[2])
+    
+    # argname = argdefaultvalue
+    elif x.kind == nnkExprEqExpr and x.len == 2:
+      result.add nnkIdentDefs.newTree(x[0], newEmptyNode(), x[1])
+    
     else:
-      error("unsupported system declaration", n)
-
-  proc parseParam(n: NimNode): tuple[name: NimNode, typ: NimNode, defaultVal: NimNode] =
-    if n.kind == nnkExprColonExpr and n.len == 2:
-      (n[0], n[1], newEmptyNode())
-    elif n.kind == nnkInfix and n.len == 3 and n[0].eqIdent("=") and n[1].kind == nnkExprColonExpr:
-      (n[1][0], n[1][1], n[2])
-    else:
-      error("expected parameter in form `name: Type`", n)
-
-  let (funcNameNode, funcParams) = getFuncNameAndArgs(declaration)
-
-  let funcNameStr =
-    if funcNameNode.kind in {nnkIdent, nnkSym}:
-      funcNameNode.strVal
-    else:
-      funcNameNode.repr
-
-  result = newStmtList()
-  var resultType = newEmptyNode()
-  var resultInit = newEmptyNode()
-  var procParams: seq[tuple[name: string, typ: NimNode, defaultVal: NimNode]]
-
-  for p in funcParams:
-    let (pname, ptype, pdefault) = parseParam(p)
-    if pname.kind in {nnkIdent, nnkSym} and pname.eqIdent("result"):
-      resultType = ptype
-      resultInit = pdefault
-    else:
-      procParams.add (pname.strVal, ptype, pdefault)
-
-  let sigKey = sigKeyFor(funcNameStr, procParams, resultType)
-  let sigCache = CacheTable("systemSigIds")
-  if not sigCache.hasKey(sigKey):
-    sigCache[sigKey] = newLit(sigCache.len)
-  let sigId = sigCache[sigKey].intVal
-  let sigSuffix = "_" & $sigId
-
-  let runTypeName = ident("RunType_" & funcNameStr & sigSuffix)
-  let systemDefTypeName = nnkBracketExpr.newTree(ident("SystemDef"), runTypeName)
-  let systemDefsVar = ident("systemDefs_" & funcNameStr & sigSuffix)
-  let systemsField = ident("systems")
-
-  let globalsCache = CacheTable("systemGlobals")
-  if not globalsCache.hasKey(sigKey):
-    globalsCache[sigKey] = newLit(1)
-
-    var defRunTypeParams = nnkFormalParams.newTree(
-      newEmptyNode(),
-      nnkIdentDefs.newTree(ident("w"), nnkVarTy.newTree(bindSym("World")), newEmptyNode())
-    )
-    for p in procParams:
-      defRunTypeParams.add nnkIdentDefs.newTree(ident(p.name), p.typ, p.defaultVal)
-    if resultType.kind != nnkEmpty:
-      defRunTypeParams.add nnkIdentDefs.newTree(ident("result"), nnkVarTy.newTree(resultType), newEmptyNode())
-
-    let runType = nnkProcTy.newTree(
-      defRunTypeParams,
-      nnkPragma.newTree(ident("nimcall"))
-    )
-
-    let runTypeDef = nnkTypeSection.newTree(
-      nnkTypeDef.newTree(
-        nnkPostfix.newTree(ident("*"), runTypeName),
-        newEmptyNode(),
-        runType
-      )
-    )
-
-    let globals = nnkVarSection.newTree(
-      nnkIdentDefs.newTree(nnkPostfix.newTree(ident("*"), systemDefsVar), nnkBracketExpr.newTree(bindSym("seq"), systemDefTypeName), nnkPrefix.newTree(ident("@"), nnkBracket.newTree()))
-    )
-
-    var worldProcParams = nnkFormalParams.newTree(
-      if resultType.kind != nnkEmpty: resultType else: newEmptyNode(),
-      nnkIdentDefs.newTree(ident("w"), nnkVarTy.newTree(bindSym("World")), newEmptyNode())
-    )
-    for p in procParams:
-      worldProcParams.add nnkIdentDefs.newTree(ident(p.name), p.typ, p.defaultVal)
-
-    var worldBody = newStmtList()
-    if resultType.kind != nnkEmpty and resultInit.kind != nnkEmpty:
-      worldBody.add quote do:
-        result = `resultInit`
-
-    let sigIdLit = newLit(sigId)
-    let systemsExpr = nnkDotExpr.newTree(ident("w"), systemsField)
-    worldBody.add quote do:
-      if not `systemsExpr`.hasKey(`sigIdLit`):
-        `systemsExpr`[`sigIdLit`] = resolveSystemOrder(`systemDefsVar`)
-
-    proc buildRunCall(runPtr: NimNode): NimNode =
-      let runCast = nnkCast.newTree(runTypeName, runPtr)
-      result = nnkCall.newTree(runCast, ident("w"))
-      for p in procParams:
-        result.add ident(p.name)
-      if resultType.kind != nnkEmpty:
-        result.add ident("result")
-
-    let runPtrIdent = ident("runPtr")
-    let callNode = buildRunCall(runPtrIdent)
-    let forBody = newStmtList(callNode)
-    let forStmt = nnkForStmt.newTree(runPtrIdent, nnkBracketExpr.newTree(systemsExpr, sigIdLit), forBody)
-    worldBody.add forStmt
-
-    let worldProc = nnkProcDef.newTree(
-      nnkPostfix.newTree(ident("*"), funcNameNode),
-      newEmptyNode(),
-      newEmptyNode(),
-      worldProcParams,
-      newEmptyNode(),
-      newEmptyNode(),
-      worldBody
-    )
-
-    result.add runTypeDef
-    result.add globals
-    result.add worldProc
+      error("unexpected syntax", x)
 
 
-macro ecs_system*(declaration, args: untyped, bodies: varargs[untyped]) =
-  # todo: refactor this
-  var argsNode = args
-  var bodyNodes: seq[NimNode]
-  if bodies.len == 0 and args.kind in {nnkStmtList, nnkDo}:
-    bodyNodes = @[args]
-    argsNode = newEmptyNode()
-  else:
-    bodyNodes = bodies[0..^1]
-
-  proc splitDecl(n: NimNode): tuple[baseDecl: NimNode, sysName: NimNode, hasSysName: bool] =
-    if n.kind == nnkDotExpr and n.len == 2:
-      (n[0], n[1], true)
-    else:
-      (n, newEmptyNode(), false)
-
-  proc getFuncNameAndArgs(n: NimNode): tuple[name: NimNode, params: seq[NimNode]] =
-    case n.kind
-    of nnkCall, nnkCommand, nnkObjConstr:
-      (n[0], n[1..^1])
-    of nnkIdent, nnkSym:
-      (n, @[])
-    else:
-      error("unsupported system declaration", n)
-
-  proc parseParam(n: NimNode): tuple[name: NimNode, typ: NimNode, defaultVal: NimNode] =
-    if n.kind == nnkExprColonExpr and n.len == 2:
-      (n[0], n[1], newEmptyNode())
-    elif n.kind == nnkInfix and n.len == 3 and n[0].eqIdent("=") and n[1].kind == nnkExprColonExpr:
-      (n[1][0], n[1][1], n[2])
-    else:
-      error("expected parameter in form `name: Type`", n)
-
-  proc stripVar(t: NimNode): NimNode =
-    if t.kind == nnkVarTy and t.len == 1:
-      t[0]
-    else:
-      t
-
-  proc collectArchetypeTypes(
-    n: NimNode,
-    outTypes: var seq[NimNode],
-    flagOpt: bool,
-    flagNot: bool,
-  ) =
-    if (
-      n.kind == nnkInfix and n.len == 3 and n[0].kind in {nnkIdent, nnkSym} and
-      n[0].eqIdent("or", "|", "and", "&", "xor")
-    ):
-      collectArchetypeTypes(n[1], outTypes, flagOpt, flagNot)
-      collectArchetypeTypes(n[2], outTypes, flagOpt, flagNot)
-    elif n.kind in {nnkTupleConstr, nnkPar, nnkStmtList}:
-      for x in n:
-        collectArchetypeTypes(x, outTypes, flagOpt, flagNot)
-    elif n.kind == nnkExprColonExpr and n.len == 2:
-      var queryPart = n[1]
-      if queryPart.kind == nnkInfix and queryPart.len == 3 and queryPart[0].eqIdent("||"):
-        queryPart = queryPart[1]
-      collectArchetypeTypes(queryPart, outTypes, flagOpt, flagNot)
-    elif n.kind in {nnkCommand, nnkCall, nnkBracketExpr, nnkPrefix} and n.len == 2 and n[0].eqIdent("opt", "?"):
-      collectArchetypeTypes(n[1], outTypes, true, flagNot)
-    elif n.kind in {nnkCommand, nnkCall, nnkBracketExpr, nnkPrefix} and n.len == 2 and n[0].eqIdent("not", "!"):
-      collectArchetypeTypes(n[1], outTypes, flagOpt, not flagNot)
-    else:
-      if not flagNot:
-        outTypes.add stripVar(n)
-
-  proc extractNames(n: NimNode, outNames: var seq[string]) =
-    if n.kind in {nnkPar, nnkTupleConstr, nnkStmtList}:
-      for x in n:
-        extractNames(x, outNames)
-    elif n.kind in {nnkIdent, nnkSym}:
-      outNames.add n.strVal
-    else:
-      outNames.add n.repr
-
-  proc stripDirectives(body: NimNode, beforeNames: var seq[string], afterNames: var seq[string]): NimNode =
-    if body.kind != nnkStmtList:
-      return body
-    result = newStmtList()
-    for stmt in body:
-      if stmt.kind in {nnkCommand, nnkCall} and stmt.len >= 2 and stmt[0].kind in {nnkIdent, nnkSym}:
-        if stmt[0].eqIdent("before"):
-          extractNames(stmt[1], beforeNames)
-          continue
-        if stmt[0].eqIdent("after"):
-          extractNames(stmt[1], afterNames)
-          continue
-      result.add stmt
-
-  proc deriveNameFromQuery(q: NimNode): string =
-    proc firstLeaf(n: NimNode): NimNode =
-      if n.kind in {nnkPar, nnkTupleConstr, nnkStmtList} and n.len == 1:
-        return firstLeaf(n[0])
-      if n.kind == nnkExprColonExpr and n.len == 2:
-        return firstLeaf(n[1])
-      if n.kind in {nnkCommand, nnkCall, nnkBracketExpr, nnkPrefix} and n.len == 2 and n[0].eqIdent("opt", "?", "not", "!"):
-        return firstLeaf(n[1])
-      n
-
-    let n = firstLeaf(q)
-    if n.kind in {nnkIdent, nnkSym}:
-      n.strVal
-    else:
-      n.repr
-
-  let (baseDecl, sysNameNode, hasSysName) = splitDecl(declaration)
-  let (funcNameNode, funcParams) = getFuncNameAndArgs(baseDecl)
-
-  let funcNameStr =
-    if funcNameNode.kind in {nnkIdent, nnkSym}:
-      funcNameNode.strVal
-    else:
-      funcNameNode.repr
-
-  var resultType = newEmptyNode()
-  var resultInit = newEmptyNode()
-  var procParams: seq[tuple[name: string, typ: NimNode, defaultVal: NimNode]]
-
-  for p in funcParams:
-    let (pname, ptype, pdefault) = parseParam(p)
-    if pname.kind in {nnkIdent, nnkSym} and pname.eqIdent("result"):
-      resultType = ptype
-      resultInit = pdefault
-    else:
-      procParams.add (pname.strVal, ptype, pdefault)
-
-  var sysNameStr = ""
-  if hasSysName:
-    if sysNameNode.kind in {nnkIdent, nnkSym}:
-      sysNameStr = sysNameNode.strVal
-    else:
-      sysNameStr = sysNameNode.repr
-  else:
-    if argsNode.kind == nnkEmpty:
-      sysNameStr = funcNameStr
-    else:
-      sysNameStr = deriveNameFromQuery(argsNode)
-
-  var arhTypes: seq[NimNode]
-  if argsNode.kind != nnkEmpty:
-    collectArchetypeTypes(argsNode, arhTypes, flagOpt = false, flagNot = false)
-  let archetypeNode =
-    if arhTypes.len == 0:
-      newLit(Archetype @[])
-    else:
-      newCall(bindSym("archetype"), arhTypes)
-
-  var beforeNames: seq[string]
-  var afterNames: seq[string]
-
-  type BlockKind = enum
-    bkCycle, bkOnce
-
-  var blocks: seq[tuple[kind: BlockKind, body: NimNode]]
-
-  for b in bodyNodes:
-    if b.kind == nnkDo:
-      let body = stripDirectives(b[^1], beforeNames, afterNames)
-      if body.kind == nnkStmtList and body.len == 0:
-        continue
-      blocks.add (bkOnce, body)
-    else:
-      let body = stripDirectives(b, beforeNames, afterNames)
-      if body.kind == nnkStmtList and body.len == 0:
-        continue
-      blocks.add (bkCycle, body)
-
-  let sysProcName = genSym(nskProc, funcNameStr & "_sys")
-
-  var runParams = nnkFormalParams.newTree(
-    newEmptyNode(),
-    nnkIdentDefs.newTree(ident("w"), nnkVarTy.newTree(bindSym("World")), newEmptyNode())
-  )
-
-  for p in procParams:
-    runParams.add nnkIdentDefs.newTree(ident(p.name), p.typ, p.defaultVal)
-
-  let hasResult = resultType.kind != nnkEmpty
-  if hasResult:
-    runParams.add nnkIdentDefs.newTree(ident("result"), nnkVarTy.newTree(resultType), newEmptyNode())
-
-  var sysBody = newStmtList()
-  proc asStmtList(n: NimNode): NimNode =
-    if n.kind == nnkStmtList: n else: newStmtList(n)
-
-  let hasArchetype = argsNode.kind != nnkEmpty
-  for blk in blocks:
-    case blk.kind
-    of bkOnce:
-      if blk.body.kind == nnkStmtList:
-        for x in blk.body:
-          sysBody.add x
-      else:
-        sysBody.add blk.body
-    of bkCycle:
-      if not hasArchetype:
-        if blk.body.kind == nnkStmtList:
-          for x in blk.body:
-            sysBody.add x
-        else:
-          sysBody.add blk.body
-      else:
-        let bodyList = asStmtList(blk.body)
-        let forEachCall = nnkCommand.newTree(
-          nnkDotExpr.newTree(ident("w"), ident("forEach")),
-          argsNode,
-          bodyList
-        )
-        sysBody.add forEachCall
-
-  let sysProcDef = nnkProcDef.newTree(
-    sysProcName,
-    newEmptyNode(),
-    newEmptyNode(),
-    runParams,
-    nnkPragma.newTree(ident("nimcall")),
-    newEmptyNode(),
-    sysBody
-  )
-
-  proc sigKeyFor(params: seq[tuple[name: string, typ: NimNode, defaultVal: NimNode]], resultType: NimNode): string =
-    var parts: seq[string]
-    for p in params:
-      parts.add p.typ.repr
-    let res = if resultType.kind == nnkEmpty: "void" else: resultType.repr
-    funcNameStr & ":" & parts.join(",") & ":" & res
-
-  let sigKey = sigKeyFor(procParams, resultType)
-  let sigCache = CacheTable("systemSigIds")
-  if not sigCache.hasKey(sigKey):
-    sigCache[sigKey] = newLit(sigCache.len)
-  let sigId = sigCache[sigKey].intVal
-  let sigSuffix = "_" & $sigId
+proc declare_ecs_system_impl(signature, rettype: NimNode): NimNode =
+  let systemName = signature.repr
+  if CacheTable("ecs systems").hasKey(systemName):
+    error("The system with this signature was already declared", signature)
   
-  if not CacheTable("systemGlobals").hasKey(sigKey):
-    error(
-      "ecs_system used without prior declare_ecs_system for signature: " &
-        sigKey,
-      declaration
-    )
+  let systemId = CacheTable("ecs systems").len
+  let suffix = signature[0].strVal & "_" & $systemId
 
-  let runTypeName = ident("RunType_" & funcNameStr & sigSuffix)
-  let systemDefTypeName = nnkBracketExpr.newTree(ident("SystemDef"), runTypeName)
-  let systemDefsVar = ident("systemDefs_" & funcNameStr & sigSuffix)
+  let runType = ident("RunType_" & suffix)
+  let systemDefs = ident("systemDefs_" & suffix)
+  let w = ident("w")
+  let runPtr = ident("runPtr")
 
-  var beforeArray = nnkBracket.newTree()
-  for s in beforeNames:
-    beforeArray.add newLit(s)
-  var afterArray = nnkBracket.newTree()
-  for s in afterNames:
-    afterArray.add newLit(s)
+  CacheTable("ecs systems")[systemName] = nnkPar.newTree(runType, systemDefs, rettype)
 
-  let beforeSeqNode = nnkPrefix.newTree(ident("@"), beforeArray)
-  let afterSeqNode = nnkPrefix.newTree(ident("@"), afterArray)
-  let registerStmt = nnkCall.newTree(
-    nnkDotExpr.newTree(systemDefsVar, ident("add")),
-    nnkObjConstr.newTree(
-      systemDefTypeName,
-      nnkExprColonExpr.newTree(ident("name"), newLit(sysNameStr)),
-      nnkExprColonExpr.newTree(ident("archetype"), archetypeNode),
-      nnkExprColonExpr.newTree(ident("before"), beforeSeqNode),
-      nnkExprColonExpr.newTree(ident("after"), afterSeqNode),
-      nnkExprColonExpr.newTree(ident("run"), sysProcName),
+  let params = formalParamsFromSignature(signature, rettype)
+  params.insert 1, nnkIdentDefs.newTree(w, nnkVarTy.newTree(bindSym("World")), newEmptyNode())
+  var procParams = copy(params)
+
+  if rettype.kind != nnkEmpty:
+    procParams.add nnkIdentDefs.newTree(ident("result"), nnkVarTy.newTree(rettype), newEmptyNode())
+    procParams[0] = newEmptyNode()
+
+  let systemCall = newCall(
+    nnkCast.newTree(runType, runPtr),
+    procParams[1..^1].mapIt(it[0])
+  )
+
+  let proctype = nnkProcTy.newTree(
+    procParams,
+    nnkPragma.newTree(
+      newIdentNode("nimcall")
     )
   )
 
-  result = newStmtList()
-  result.add sysProcDef
-  result.add registerStmt
+  let procdef = nnkProcDef.newTree(
+    nnkPostfix.newTree(
+      ident("*"),
+      signature[0]
+    ),
+    newEmptyNode(),
+    newEmptyNode(),
+    params,
+    nnkPragma.newTree(
+      newIdentNode("nimcall")
+    ),
+    newEmptyNode(),
+    quote do:
+      if not hasKey(`w`.systems, `systemId`):
+        `w`.systems[`systemId`] = resolveSystemOrder(`systemDefs`)
+      for `runPtr` in items(`w`.systems[`systemId`]):
+        `systemCall`
+  )
 
+  quote do:
+    type
+      `runType`* = `proctype`
+    var `systemDefs`*: seq[SystemDef[`runType`]] = @[]
+    `procdef`
+
+macro declare_ecs_system*(signature: untyped) =
+  declare_ecs_system_impl(signature, newEmptyNode())
+
+macro declare_ecs_system*(signature: untyped, rettype: untyped) =
+  declare_ecs_system_impl(signature, rettype)
+
+
+proc ecs_system_impl(signature, args, body: NimNode): NimNode =
+  proc processBody(body: NimNode, before, after: var seq[string]): NimNode =
+    result = newStmtList()
+    for x in body:
+      # before procId
+      if x.kind in CallNodes and x.len == 2 and x[0].eqIdent("before"):
+        before.add x[1].repr
+      
+      # after procId
+      elif x.kind in CallNodes and x.len == 2 and x[0].eqIdent("after"):
+        after.add x[1].repr
+      
+      else:
+        result.add x
+  
+  result = newStmtList()
+
+  let systemName = signature.repr
+  if not CacheTable("ecs systems").hasKey(systemName):
+    error("The system with this signature was not declared", signature)
+  
+  let info = CacheTable("ecs systems")[systemName]
+  let runType = info[0]
+  let systemDefs = info[1]
+  let rettype = info[2]
+
+  let procName = genSym(nskProc, "system_" & signature[0].strVal)
+  
+  let procId =
+    # procId
+    if args.kind == nnkIdent:
+      args.strVal
+    # (x: ComponentType).procId
+    elif args.kind == nnkDotExpr and args.len == 2 and args[1].kind == nnkIdent:
+      args[1].strVal
+    # (x: ComponentType)
+    else:
+      args.repr
+
+  let forEachArgs =
+    # procId
+    if args.kind == nnkIdent:
+      newEmptyNode()
+    # (x: ComponentType).procId
+    elif args.kind == nnkDotExpr and args.len == 2 and args[1].kind == nnkIdent:
+      args[0]
+    # (x: ComponentType)
+    else:
+      args
+
+  let params = formalParamsFromSignature(signature, newEmptyNode())
+  params.insert 1, nnkIdentDefs.newTree(ident("w"), nnkVarTy.newTree(bindSym("World")), newEmptyNode())
+
+  if rettype.kind != nnkEmpty:
+    params.add nnkIdentDefs.newTree(ident("result"), nnkVarTy.newTree(rettype), newEmptyNode())
+
+  var before, after: seq[string]
+
+  var procBody = processBody(body, before, after)
+  if forEachArgs.kind != nnkEmpty:
+    procBody = newCall(bindSym("forEach"), ident("w"), forEachArgs, procBody)
+
+  result.add nnkProcDef.newTree(
+    procName,
+    newEmptyNode(),
+    newEmptyNode(),
+    params,
+    nnkPragma.newTree(
+      newIdentNode("nimcall")
+    ),
+    newEmptyNode(),
+    procBody
+  )
+
+  result.add quote do:
+    add(`systemDefs`, SystemDef[`runType`](name: `procId`, before: `before`, after: `after`, run: `procName`))
+
+
+macro ecs_system*(signature, body: untyped) =
+  ecs_system_impl(signature, ident("anonimus"), body)
+
+macro ecs_system*(signature, args, body: untyped) =
+  ecs_system_impl(signature, args, body)
 
