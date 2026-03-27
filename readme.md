@@ -81,7 +81,7 @@ for each supports some pattern matching:
 Update can be used to remove or add components to entity.
 
 ```nim
-w.update:
+w.update entId:
   add NewComponentA()
   add NewComponentB()
   remove OldComponent()
