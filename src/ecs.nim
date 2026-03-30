@@ -172,7 +172,7 @@ proc retainTypeIds*(filename: string) {.compileTime.} =
   ## loads type ids from a file, can be used to ensure ABI-compatibility
   let newTypeIds = readFile(filename).splitLines
   for i, x in newTypeIds:
-    if x != typeIds[i]:
+    if i < typeIds.len and x != typeIds[i]:
       error("TypeId mistmatch for index " & $i & " (should be " & x & ", but already used as " & typeIds[i] & ")")
   
   typeIds = newTypeIds
