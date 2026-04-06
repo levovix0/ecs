@@ -75,6 +75,10 @@ for each supports some pattern matching:
 - `(name: opt ComponentX)` - matches even if entity has no `ComponentX`, use `has ComponentX` to check for it's existance inside body
 - `(name: ComponentX||defaultValue)` - shorthand for `(name: opt ComponentX)` and `let name = if has ComponentX: name else: defaultValue` in body
 
+inside forEach body, these templates can be used:
+- `has(T)` - returns `true` if current entity has `T` component
+- `the(T)` - returns the `var T` reference to the `T` component of current entity (can be used instead of named component queries `(name: Component)`)
+
 
 ## Update
 

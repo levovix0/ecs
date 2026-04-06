@@ -231,6 +231,10 @@ proc queryHas_impl(q: ComponentsQuery, qarh: static Archetype, tid: static TypeI
   const i = qarh.find(tid)
   return i != -1 and q[i] != nil
 
+proc queryThe_impl[T](q: ComponentsQuery, qarh: static Archetype, tid: static TypeId, entIdx: int): var T =
+  const i = qarh.find(tid)
+  return cast[ptr seq[T]](q[i])[][entIdx]
+
 
 proc queryItemCount(q: ComponentsQuery): int =
   for arr in q:
@@ -253,6 +257,8 @@ macro forEach*(w: var World, query: untyped, body: untyped) =
   let idx = nskForVar.gensym("idx")
   let hasTemplate = quote do:
     template has(t: typedesc): bool {.used.} = queryHas_impl(`cquery`, `carh`, typeid(t))
+  let theTemplate = quote do:
+    template the(t: typedesc): auto {.used.} = queryThe_impl[t](`cquery`, `carh`, typeid(t), `idx`)
   
 
   proc typWithoutModifiers(t: NimNode): NimNode =
@@ -390,6 +396,7 @@ macro forEach*(w: var World, query: untyped, body: untyped) =
   result.add quote do:
     for `cquery` in `cqueries`:
       `hasTemplate`
+      `theTemplate`
       for `idx` in 0..<queryItemCount(`cquery`):
         `vars`
         block:

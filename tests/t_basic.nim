@@ -78,9 +78,9 @@ test "basic ecs":
   w.forEach (id: EntityId, e: WorldEntity, b: Arrow):
     echo "  [", id.int, "] ", e, " && ", b
 
-  echo "\nw.forEach (id: EntityId, DeletedEntity):"
-  w.forEach (id: EntityId, DeletedEntity):
-    echo "  [", id.int, "] despawned"
+  echo "\nw.forEach (EntityId, DeletedEntity):"
+  w.forEach (EntityId, DeletedEntity):
+    echo "  [", the(EntityId).int, "] despawned"
 
   echo "\nw.cleanupDeleted()"
   w.cleanupDeleted()
