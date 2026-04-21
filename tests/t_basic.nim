@@ -129,6 +129,13 @@ test "basic ecs":
   w.print("print(prefix: string): ")
 
 
+  # random component access
+  echo "\nw[b1, Arrow]"
+  echo w[b1, Arrow]
+  w[b1, Arrow] = Arrow(direction: Vec2(x: -3, y: -4), speed: -42)
+  echo w[b1, Arrow]
+
+
   static:
     for i, t in typeIds:
       echo "[", i, "] ", t

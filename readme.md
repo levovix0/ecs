@@ -123,3 +123,16 @@ ecs_system count():
 
 echo w.count()
 ```
+
+
+## Random access
+
+This is slower than using forEach for bunches of entities, but sometimes it may be needed
+
+```nim
+let counter = w.spawn 1
+echo w[counter, int]
+w[counter, int] = 2
+inc w[counter, int]
+echo w[counter, int]  # 3
+```

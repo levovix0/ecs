@@ -876,6 +876,33 @@ template removeComponentIf*(w: var World, comp, cond) =
 
 
 
+proc getComponentPtr(w: World, ent: EntityId, componentTypeId: TypeId, sizeof: int): pointer =
+  ## note: this proc is slow
+  let entRec = w.entities[ent.int]
+  if componentTypeId notin entRec.archetype: raise ValueError.newException("Component not found")
+  let i = entRec.archetype.find(componentTypeId)
+  return cast[pointer](cast[int](w.archetypes[entRec.archetype].components[i].data[0].addr) + sizeof * entRec.index)
+
+proc hasComponentImpl(w: World, ent: EntityId, componentTypeId: TypeId): bool =
+  componentTypeId in w.entities[ent.int].archetype
+  
+
+template `[]`*(w: World, ent: EntityId, componentType: typedesc): auto =
+  bind getComponentPtr
+  bind typeid
+  cast[ptr componentType](getComponentPtr(w, ent, typeid(componentType), sizeof(componentType)))[]
+
+template `[]=`*(w: World, ent: EntityId, componentType: typedesc, v: auto) =
+  bind getComponentPtr
+  bind typeid
+  cast[ptr componentType](getComponentPtr(w, ent, typeid(componentType), sizeof(componentType)))[] = v
+
+template hasComponent*(w: World, ent: EntityId, componentType: typedesc): bool =
+  bind hasComponentImpl
+  hasComponentImpl(w, ent, typeid(componentType))
+
+
+
 # ===============
 # --- systems ---
 # ===============
