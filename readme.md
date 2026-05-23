@@ -136,3 +136,6 @@ w[counter, int] = 2
 inc w[counter, int]
 echo w[counter, int]  # 3
 ```
+
+Note that `w[counter, string] = "hello"` here will raise an exception that component was not found. To add/remove components use `update`
+

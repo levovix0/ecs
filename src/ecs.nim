@@ -39,7 +39,7 @@ type
     ## len is same as count of types in archetype, order is based on component type ids.
 
 
-  World* = object
+  World* = ref object
     entities*: seq[EntityRecord]
     archetypes*: Table[Archetype, ArchetypeRecord]
     systems*: Table[int, seq[pointer]]
@@ -202,7 +202,7 @@ proc `=destroy`(x: ComponentRecord) {.raises: [Exception].} =
     x.destroy(x.data.addr)
 
 
-proc componentQueryAll*(w: var World, tc: Archetype): ComponentsQueries =
+proc componentQueryAll*(w: World, tc: Archetype): ComponentsQueries =
   for k, v in w.archetypes.mpairs:
     if tc in k:
       var query: ComponentsQuery
@@ -212,7 +212,7 @@ proc componentQueryAll*(w: var World, tc: Archetype): ComponentsQueries =
       result.add query
 
 
-proc componentQueryAllWithOptional*(w: var World, cond: proc(arh: Archetype): bool, tc: Archetype): ComponentsQueries =
+proc componentQueryAllWithOptional*(w: World, cond: proc(arh: Archetype): bool, tc: Archetype): ComponentsQueries =
   for k, v in w.archetypes.mpairs:
     if cond(k):
       var query: ComponentsQuery
@@ -243,7 +243,7 @@ proc queryItemCount(q: ComponentsQuery): int =
 
 
 
-macro forEach*(w: var World, query: untyped, body: untyped) =
+macro forEach*(w: World, query: untyped, body: untyped) =
   result = newStmtList()
 
   var outCond = newEmptyNode()
@@ -408,7 +408,7 @@ macro forEach*(w: var World, query: untyped, body: untyped) =
 # --- spawn / respawn / destroy ----
 # ==================================
 
-template getOrCreateArchetypeRecord(w: var World, archetype: Archetype, orCreate: ArchetypeRecord): ptr ArchetypeRecord =
+template getOrCreateArchetypeRecord(w: World, archetype: Archetype, orCreate: ArchetypeRecord): ptr ArchetypeRecord =
   if archetype.len != 0:
     let pt = w.archetypes.mgetOrPut(archetype, ArchetypeRecord()).addr
     if pt[].components.len == 0:
@@ -547,7 +547,7 @@ proc genEntityCtor(entityComponents: NimNode, archetype: Archetype): NimNode =
     )
 
 
-macro spawn*(w: var World, components: varargs[typed]): EntityId =
+macro spawn*(w: World, components: varargs[typed]): EntityId =
   result = newStmtList()
 
   let components = bindSym("EntityId") & components[0..^1]
@@ -589,7 +589,7 @@ macro spawn*(w: var World, components: varargs[typed]): EntityId =
   result.add entityId
 
 
-proc preRemoveEntity(w: var World, entity: EntityId) =
+proc preRemoveEntity(w: World, entity: EntityId) =
   ## removes all current components of entity, updates index of entity that has replaced these components (due to `del`)
   static: assert typeid(EntityId).int == 0
   
@@ -604,7 +604,7 @@ proc preRemoveEntity(w: var World, entity: EntityId) =
     w.entities[eids[][ent.index].int].index = ent.index
 
 
-macro respawn*(w: var World, entity: EntityId, components: varargs[typed]) =
+macro respawn*(w: World, entity: EntityId, components: varargs[typed]) =
   result = newStmtList()
 
   let components = bindSym("EntityId") & components[0..^1]
@@ -633,11 +633,11 @@ macro respawn*(w: var World, entity: EntityId, components: varargs[typed]) =
   genAssignComponents(w, components, entityId, entityComponents, result)
 
 
-proc despawn*(w: var World, entity: EntityId) =
+proc despawn*(w: World, entity: EntityId) =
   w.respawn(entity, DeletedEntity())
 
 
-proc cleanupDeleted*(w: var World) =
+proc cleanupDeleted*(w: World) =
   let deletedType = typeid(DeletedEntity)
 
   # Remove deleted entities from component storage and from `w.entities`.
@@ -670,7 +670,7 @@ proc componentIndexOf(ar: ArchetypeRecord, tid: TypeId): int =
 # ===============
 
 proc ensureArchetypeRecordForUpdate(
-  w: var World,
+  w: World,
   oldArh: Archetype,
   newArh: Archetype,
   addArh: Archetype,
@@ -704,7 +704,7 @@ proc ensureArchetypeRecordForUpdate(
 
 
 proc updateEntityArchetype(
-  w: var World,
+  w: World,
   entity: EntityId,
   addArh: Archetype,
   removeArh: Archetype,
@@ -753,7 +753,7 @@ proc setOrInsertComponent[T](ar: var ArchetypeRecord, idx: int, tid: TypeId, val
     assert false, "component array is out of sync with entity indices"
 
 
-macro update*(w: var World, entity: EntityId, bodies: varargs[untyped]) =
+macro update*(w: World, entity: EntityId, bodies: varargs[untyped]) =
   proc flatten(n: NimNode, outNodes: var seq[NimNode]) =
     if n.kind in {nnkStmtList, nnkPar, nnkTupleConstr}:
       for x in n:
@@ -839,7 +839,7 @@ macro update*(w: var World, entity: EntityId, bodies: varargs[untyped]) =
       setOrInsertComponent(`components`[], `ent`.index, typeid(typeof(`body`)), `body`)
 
 
-macro makeEntity*(w: var World, bodies: varargs[untyped]): EntityId =
+macro makeEntity*(w: World, bodies: varargs[untyped]): EntityId =
   result = newCall(bindSym("spawn"), w)
   for body in bodies:
     if body.kind == nnkStmtList:
@@ -848,7 +848,7 @@ macro makeEntity*(w: var World, bodies: varargs[untyped]): EntityId =
     else:
       result.add body
 
-macro add*(w: var World, bodies: varargs[untyped]) =
+macro add*(w: World, bodies: varargs[untyped]) =
   result = newCall(bindSym("spawn"), w)
   for body in bodies:
     if body.kind == nnkStmtList:
@@ -860,14 +860,14 @@ macro add*(w: var World, bodies: varargs[untyped]) =
 
 
 
-template appendComponentIf*(w: var World, comp, cond) =
+template appendComponentIf*(w: World, comp, cond) =
   var entities: seq[EntityId]
   w.forEach (id: EntityId, cond, not typeof(comp)):
     entities.add id
   for ent in entities:
     w.update ent: add comp
 
-template removeComponentIf*(w: var World, comp, cond) =
+template removeComponentIf*(w: World, comp, cond) =
   var entities: seq[EntityId]
   w.forEach (id: EntityId, cond, typeof(comp)):
     entities.add id
