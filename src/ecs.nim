@@ -264,8 +264,17 @@ macro forEach*(w: World, query: untyped, body: untyped) =
   proc typWithoutModifiers(t: NimNode): NimNode =
     if t.kind == nnkVarTy: return t[0]
     else: t
-  
-  
+
+  proc collectOrTypes(node: NimNode): seq[NimNode] =
+    if node.kind == nnkInfix and node.len == 3 and node[0].eqIdent("|", "or"):
+      result.add collectOrTypes(node[1])
+      result.add collectOrTypes(node[2])
+    elif node.kind in {nnkPar, nnkTupleConstr} and node.len == 1:
+      result.add collectOrTypes(node[0])
+    else:
+      result.add node
+
+
   template subTrQuery(n: NimNode, cond: NimNode) {.dirty.} =
     trQuery(n, cond, outArchetype, outVars, varType, flag_opt, flag_not)
 
@@ -343,12 +352,23 @@ macro forEach*(w: World, query: untyped, body: untyped) =
         let castedValue = quote do: cast[ptr seq[`seqType`]](`cquery`[static(find(`carh`, typeid(`varType`)))])[][`idx`]
         let nameN = n[0]
         if hasDefaultValue:
-          outVars[name] = quoteWithoutLineInfo do:
-            let `nameN`: `varType` =
-              if has(`varType`):
-                cast[ptr seq[`seqType`]](`cquery`[static(find(`carh`, typeid(`varType`)))])[][`idx`]
-              else:
-                `defaultValue`
+          let orTypes = collectOrTypes(queryPart)
+          if orTypes.len > 1:
+            var chainExpr = defaultValue
+            for i in countdown(orTypes.high, 0):
+              let t = orTypes[i]
+              let prevChain = chainExpr
+              chainExpr = quote do:
+                (if queryHas_impl(`cquery`, `carh`, typeid(`t`)): cast[ptr seq[`seqType`]](`cquery`[static(find(`carh`, typeid(`t`)))])[][`idx`] else: `prevChain`)
+            outVars[name] = quoteWithoutLineInfo do:
+              let `nameN`: `varType` = `chainExpr`
+          else:
+            outVars[name] = quoteWithoutLineInfo do:
+              let `nameN`: `varType` =
+                if has(`varType`):
+                  cast[ptr seq[`seqType`]](`cquery`[static(find(`carh`, typeid(`varType`)))])[][`idx`]
+                else:
+                  `defaultValue`
         else:
           outVars[name] = quote do:
             template `nameN`: `varType` = `castedValue`
@@ -547,7 +567,7 @@ proc genEntityCtor(entityComponents: NimNode, archetype: Archetype): NimNode =
     )
 
 
-macro spawn*(w: World, components: varargs[typed]): EntityId =
+macro spawnImpl*(w: World, components: varargs[typed]): EntityId =
   result = newStmtList()
 
   let components = bindSym("EntityId") & components[0..^1]
@@ -839,8 +859,17 @@ macro update*(w: World, entity: EntityId, bodies: varargs[untyped]) =
       setOrInsertComponent(`components`[], `ent`.index, typeid(typeof(`body`)), `body`)
 
 
+macro spawn*(w: World, bodies: varargs[untyped]): EntityId =
+  result = newCall(bindSym("spawnImpl"), w)
+  for body in bodies:
+    if body.kind == nnkStmtList:
+      for x in body:
+        result.add x
+    else:
+      result.add body
+
 macro makeEntity*(w: World, bodies: varargs[untyped]): EntityId =
-  result = newCall(bindSym("spawn"), w)
+  result = newCall(bindSym("spawnImpl"), w)
   for body in bodies:
     if body.kind == nnkStmtList:
       for x in body:
@@ -849,7 +878,7 @@ macro makeEntity*(w: World, bodies: varargs[untyped]): EntityId =
       result.add body
 
 macro add*(w: World, bodies: varargs[untyped]) =
-  result = newCall(bindSym("spawn"), w)
+  result = newCall(bindSym("spawnImpl"), w)
   for body in bodies:
     if body.kind == nnkStmtList:
       for x in body:

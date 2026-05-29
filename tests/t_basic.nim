@@ -20,7 +20,7 @@ test "basic ecs":
       pos: Vec2
 
 
-  var w: World
+  var w = World()
 
 
   let b1 = w.spawn(
@@ -139,3 +139,29 @@ test "basic ecs":
   static:
     for i, t in typeIds:
       echo "[", i, "] ", t
+
+
+test "forEach (CompA|CompB) || default":
+  type
+    CompA = object
+      val: int
+    CompB = object
+      val: int
+
+  var w = World()
+
+  let eA = w.spawn(CompA(val: 10))
+  let eB = w.spawn(CompB(val: 20))
+  let eAB = w.spawn(CompA(val: 30), CompB(val: 40))
+  let eNone = w.spawn(DeletedEntity())
+
+  var results: seq[(int, int)]
+
+  w.forEach (id: EntityId, x: (CompA|CompB) || CompB(val: -1)):
+    results.add (id.int, x.val)
+
+  check results.len == 4
+  check (eA.int, 10) in results    # CompA takes priority
+  check (eB.int, 20) in results    # falls back to CompB
+  check (eAB.int, 30) in results   # CompA preferred over CompB
+  check (eNone.int, -1) in results # default when neither present
