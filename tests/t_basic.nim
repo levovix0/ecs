@@ -15,7 +15,7 @@ test "basic ecs":
     Arrow = object
       direction: Vec2
       speed: float32
-  
+
     WorldEntity = object
       pos: Vec2
 
@@ -53,15 +53,15 @@ test "basic ecs":
       echo "  ", e, " && ", b
     else:
       echo "  no WorldEntity", " && ", b
-  
+
   echo "\nmodifications..."
   w.despawn b1
-  w.despawn b1
+
+  check not w.isAlive(b1)
 
   w.update b2:
     WorldEntity(pos: Vec2(x: 0.07, y: 1.55e11))
-    # remove: Arrow
-  
+
   w.respawn(b3,
     Arrow(direction: Vec2(x: -2, y: -3), speed: 40),
   )
@@ -76,18 +76,7 @@ test "basic ecs":
 
   echo "\nw.forEach (id: EntityId, e: WorldEntity, b: Arrow):"
   w.forEach (id: EntityId, e: WorldEntity, b: Arrow):
-    echo "  [", id.int, "] ", e, " && ", b
-
-  echo "\nw.forEach (EntityId, DeletedEntity):"
-  w.forEach (EntityId, DeletedEntity):
-    echo "  [", the(EntityId).int, "] despawned"
-
-  echo "\nw.cleanupDeleted()"
-  w.cleanupDeleted()
-
-  echo "\nw.forEach (id: EntityId, DeletedEntity):"
-  w.forEach (id: EntityId, DeletedEntity):
-    echo "  [", id.int, "] despawned"
+    echo "  [", entityIndex(id), "] ", e, " && ", b
 
 
   # systems with names
@@ -111,7 +100,7 @@ test "basic ecs":
     echo "once, before cycle"
     w.forEach (id: EntityId):
       inc result
-      echo id.int, " in cycle"
+      echo entityIndex(id), " in cycle"
     echo "once, after cycle"
 
   echo "\nw.count()"
@@ -130,10 +119,10 @@ test "basic ecs":
 
 
   # random component access
-  echo "\nw[b1, Arrow]"
-  echo w[b1, Arrow]
-  w[b1, Arrow] = Arrow(direction: Vec2(x: -3, y: -4), speed: -42)
-  echo w[b1, Arrow]
+  echo "\nw[b3, Arrow]"
+  echo w[b3, Arrow]
+  w[b3, Arrow] = Arrow(direction: Vec2(x: -3, y: -4), speed: -42)
+  echo w[b3, Arrow]
 
 
   static:
@@ -147,24 +136,25 @@ test "forEach (CompA|CompB) || default":
       val: int
     CompB = object
       val: int
+    Tag = object
 
   var w = World()
 
   let eA = w.spawn(CompA(val: 10))
   let eB = w.spawn(CompB(val: 20))
   let eAB = w.spawn(CompA(val: 30), CompB(val: 40))
-  let eNone = w.spawn(DeletedEntity())
+  let eNone = w.spawn(Tag())
 
   var results: seq[(int, int)]
 
   w.forEach (id: EntityId, x: (CompA|CompB) || CompB(val: -1)):
-    results.add (id.int, x.val)
+    results.add (entityIndex(id), x.val)
 
   check results.len == 4
-  check (eA.int, 10) in results    # CompA takes priority
-  check (eB.int, 20) in results    # falls back to CompB
-  check (eAB.int, 30) in results   # CompA preferred over CompB
-  check (eNone.int, -1) in results # default when neither present
+  check (entityIndex(eA), 10) in results    # CompA takes priority
+  check (entityIndex(eB), 20) in results    # falls back to CompB
+  check (entityIndex(eAB), 30) in results   # CompA preferred over CompB
+  check (entityIndex(eNone), -1) in results # default when neither present
 
 
 test "update with multiple components simultaneously":
@@ -179,7 +169,7 @@ test "update with multiple components simultaneously":
   let e1 = w.spawn(Pos(x: "px", y: "py"))
   let e2 = w.spawn(Vel(dx: "vx", dy: "vy"))
 
-  
+
   w.update e1:
     Vel(dx: "new_vx", dy: "new_vy")
 
@@ -198,10 +188,7 @@ test "update with multiple components simultaneously":
   check w[e2, Pos].y == "new_py"
 
 
-  let e3 = w.spawn(DeletedEntity())
-  w.update e3:
-    Vel(dx: "e3_vx", dy: "e3_vy")
-    Pos(x: "e3_px", y: "e3_py")
+  let e3 = w.spawn(Pos(x: "e3_px", y: "e3_py"), Vel(dx: "e3_vx", dy: "e3_vy"))
 
   check w[e3, Pos].x == "e3_px"
   check w[e3, Vel].dx == "e3_vx"
@@ -209,4 +196,101 @@ test "update with multiple components simultaneously":
   w.despawn e1
   w.despawn e2
   w.despawn e3
-  w.cleanupDeleted()
+
+  check not w.isAlive(e1)
+  check not w.isAlive(e2)
+  check not w.isAlive(e3)
+
+
+test "despawn and update during forEach":
+  type
+    Health = object
+      hp: int
+    Marked = object
+
+  var w = World()
+
+  let e1 = w.spawn(Health(hp: 10))
+  let e2 = w.spawn(Health(hp: 0))
+  let e3 = w.spawn(Health(hp: 5))
+
+  # despawn dead entities during forEach — safe with tombstones
+  w.forEach (id: EntityId, h: Health):
+    if h.hp <= 0:
+      w.despawn id
+
+  check w.isAlive(e1)
+  check not w.isAlive(e2)
+  check w.isAlive(e3)
+
+  # update archetype during forEach — safe with tombstones
+  w.forEach (id: EntityId, h: Health):
+    if h.hp < 10:
+      w.update id:
+        Marked()
+
+  check w.hasComponent(e3, Marked)
+  check not w.hasComponent(e1, Marked)
+
+  # new entities added to iterated archetype should be visited
+  var visitCount = 0
+  let newId = w.spawn(Health(hp: 99))
+  discard newId  # pre-spawn before loop
+
+  var spawnedDuringLoop = noEntity
+  w.forEach (h: Health):
+    inc visitCount
+    if spawnedDuringLoop == noEntity and h.hp == 99:
+      spawnedDuringLoop = w.spawn(Health(hp: 77))
+
+  # both the pre-spawned entity and the one spawned during forEach should be visited
+  check spawnedDuringLoop != noEntity
+  check visitCount >= 2
+
+
+test "generation counter — stale EntityId":
+  type
+    Data = object
+      x: int
+
+  var w = World()
+
+  let e = w.spawn(Data(x: 42))
+  let staleId = e
+
+  w.despawn e
+  check not w.isAlive(staleId)
+
+  let e2 = w.spawn(Data(x: 99))
+  # e2 may reuse the same slot but has different generation
+  check not w.isAlive(staleId)
+  check w.isAlive(e2)
+
+  check noEntity != e2
+  check isNoEntity(noEntity)
+
+
+test "nested forEach":
+  type
+    A = object
+      v: int
+    B = object
+      v: int
+
+  var w = World()
+
+  discard w.spawn(A(v: 1))
+  discard w.spawn(A(v: 2))
+  discard w.spawn(B(v: 10))
+  discard w.spawn(B(v: 20))
+
+  var pairs: seq[(int, int)]
+  w.forEach (a: A):
+    w.forEach (b: B):
+      pairs.add (a.v, b.v)
+
+  check pairs.len == 4
+  check (1, 10) in pairs
+  check (1, 20) in pairs
+  check (2, 10) in pairs
+  check (2, 20) in pairs

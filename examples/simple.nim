@@ -21,7 +21,7 @@ ecs_system move(), (v: var Vec2, speed: Speed||Vec2(x: 1, y: 0)):
   v.y += speed.y
 
 ecs_system move(), (id: EntityId, v: Vec2).echo:
-  echo id.int, ": ", v
+  echo entityIndex(id), ": ", v
 
 w.move()
 

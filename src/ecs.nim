@@ -10,39 +10,36 @@ type
 
   EntityRecord* = object
     archetype*: Archetype
-    index*: int  ## index of enitity components in component records for the archetype in world
+    index*: int32    ## position of entity components in archetype component arrays
+    generation*: int32  ## current generation; matches EntityId.generation while alive
 
+  EntityId* = distinct int64
+    ## packed (index: int32, generation: int16) handle to an entity
 
-  EntityId* = distinct int
-    ## index of the entity in world.entities seq
-  
-  DeletedEntity* = object
-    ## a temporary mark that entity should be deleted
-
-  
   ComponentRecord* = object
     data*: seq[byte]
     typ*: TypeId
     trace*: proc(arr: pointer, env: pointer) {.nimcall.}
     destroy*: proc(arr: pointer) {.nimcall.}
     remove*: proc(arr: pointer, i: int, moveTo: pointer) {.nimcall.}
-
+    moveOut*: proc(arr: pointer, i: int, moveTo: pointer) {.nimcall.}
 
   ArchetypeRecord* = object
     components*: seq[ComponentRecord]
+    tombstoneCount*: int
     # todo: optimize for zero-sized components (flags)
-  
-  
+
   ComponentsQueries* = seq[ComponentsQuery]
   ComponentsQuery* = seq[pointer]
     ## pointers to seq[T], where T is the type of the component.
     ## len is same as count of types in archetype, order is based on component type ids.
 
-
   World* = ref object
     entities*: seq[EntityRecord]
     archetypes*: Table[Archetype, ArchetypeRecord]
     systems*: Table[int, seq[pointer]]
+    freeList*: seq[int]
+    iterDepth*: int
 
 
   SystemDef*[Run] = object
@@ -163,6 +160,28 @@ macro archetype*(typs: varargs[typed]): Archetype =
 
 proc `==`*(a, b: EntityId): bool {.borrow.}
 
+const idxMask: int64 = 0xFFFFFFFF
+
+proc entityIndex*(eid: EntityId): int =
+  int(eid.int64 and idxMask)
+
+proc entityGeneration*(eid: EntityId): int32 =
+  int32((eid.int64 shr 32) and 0xFFFF)
+
+proc makeEntityId*(index: int, generation: int32): EntityId =
+  EntityId((int64(generation) shl 32) or int64(index))
+
+const noEntity* = EntityId(-1'i64)
+
+proc isNoEntity*(eid: EntityId): bool =
+  eid.int64 == -1
+
+proc isAlive*(w: World, eid: EntityId): bool =
+  let i = entityIndex(eid)
+  not isNoEntity(eid) and i < w.entities.len and
+  w.entities[i].generation == entityGeneration(eid) and
+  w.entities[i].archetype.len > 0
+
 
 proc storeTypeIds*(filename: string) {.compileTime.} =
   ## saves current allocated type ids to a file, so them can be retained later
@@ -254,7 +273,8 @@ macro forEach*(w: World, query: untyped, body: untyped) =
   let carh = nskConst.gensym("arh")
   let cqueries = nskLet.gensym("queries")
   let cquery = nskForVar.gensym("query")
-  let idx = nskForVar.gensym("idx")
+  let idx = genSym(nskLet, "idx")
+  let outerIdx = genSym(nskVar, "outerIdx")
   let hasTemplate = quote do:
     template has(t: typedesc): bool {.used.} = queryHas_impl(`cquery`, `carh`, typeid(t))
   let theTemplate = quote do:
@@ -401,6 +421,10 @@ macro forEach*(w: World, query: untyped, body: untyped) =
 
   trQuery(query, outCond, outArchetype, outVars, varType, flag_opt=false, flag_not=false)
 
+  # Always include EntityId in carh so cquery[0] is always the EntityId array pointer
+  let entityIdSym = bindSym("EntityId")
+  if not outArchetype.anyIt(it.kind in {nnkSym, nnkIdent} and it.strVal.eqIdent("EntityId")):
+    outArchetype.add entityIdSym
 
   let tc = newCall(bindSym("archetype"), outArchetype)
   let vars = newStmtList(outVars.values.toSeq)
@@ -414,13 +438,23 @@ macro forEach*(w: World, query: untyped, body: untyped) =
     )
 
   result.add quote do:
-    for `cquery` in `cqueries`:
-      `hasTemplate`
-      `theTemplate`
-      for `idx` in 0..<queryItemCount(`cquery`):
-        `vars`
-        block:
-          `body`
+    inc `w`.iterDepth
+    try:
+      for `cquery` in `cqueries`:
+        `hasTemplate`
+        `theTemplate`
+        var `outerIdx` = 0
+        while `outerIdx` < queryItemCount(`cquery`):
+          let `idx` = `outerIdx`
+          inc `outerIdx`
+          if isNoEntity(cast[ptr seq[EntityId]](`cquery`[0])[][`idx`]): continue
+          `vars`
+          block:
+            `body`
+    finally:
+      dec `w`.iterDepth
+      if `w`.iterDepth == 0:
+        compactAllTombstones(`w`)
 
 
 
@@ -475,6 +509,14 @@ macro componentRecordConstructorFromSym(x: typed): ComponentRecord =
           if moveTo != nil:
             cast[ptr seq[`typ`]](moveTo)[].add move(cast[ptr seq[`typ`]](arr)[][i])
           cast[ptr seq[`typ`]](arr)[].del i
+      )
+    ),
+    # moveOut*: proc(arr: pointer, i: int, moveTo: pointer) {.nimcall.}
+    nnkExprColonExpr.newTree(
+      ident("moveOut"), (quote do:
+        proc(arr: pointer, i: int, moveTo: pointer) {.nimcall.} =
+          if moveTo != nil:
+            cast[ptr seq[`typ`]](moveTo)[].add move(cast[ptr seq[`typ`]](arr)[][i])
       )
     ),
   )
@@ -536,7 +578,7 @@ proc genAssignComponents(w: NimNode, components: seq[NimNode], entityId: NimNode
     )
 
 
-proc genEntityCtor(entityComponents: NimNode, archetype: Archetype): NimNode =
+proc genEntityCtor(entityComponents: NimNode, archetype: Archetype, generationExpr: NimNode): NimNode =
   static: assert typeid(EntityId).int == 0
   assert archetype[0] == typeid(EntityId)
 
@@ -548,23 +590,38 @@ proc genEntityCtor(entityComponents: NimNode, archetype: Archetype): NimNode =
       ),
       nnkExprColonExpr.newTree(
         ident("index"),
-        nnkDotExpr.newTree(
+        newCall(bindSym("int32"),
           nnkDotExpr.newTree(
-            nnkBracketExpr.newTree(
-              nnkDotExpr.newTree(
-                nnkBracketExpr.newTree(
-                  entityComponents
+            nnkDotExpr.newTree(
+              nnkBracketExpr.newTree(
+                nnkDotExpr.newTree(
+                  nnkBracketExpr.newTree(
+                    entityComponents
+                  ),
+                  ident("components")
                 ),
-                ident("components")
+                newLit(0)
               ),
-              newLit(0)
+              ident("data")
             ),
-            ident("data")
-          ),
-          ident("len")
+            ident("len")
+          )
         )
+      ),
+      nnkExprColonExpr.newTree(
+        ident("generation"),
+        generationExpr
       )
     )
+
+
+proc allocEntitySlot(w: World): tuple[index: int, generation: int32] =
+  if w.freeList.len > 0:
+    let idx = w.freeList.pop()
+    result = (idx, w.entities[idx].generation)
+  else:
+    result = (w.entities.len, 1'i32)
+    w.entities.setLen(w.entities.len + 1)
 
 
 macro spawnImpl*(w: World, components: varargs[typed]): EntityId =
@@ -573,7 +630,8 @@ macro spawnImpl*(w: World, components: varargs[typed]): EntityId =
   let components = bindSym("EntityId") & components[0..^1]
   let archetype = archetypeFromSym(components[0..^1])
   let entityComponents = genSym(nskLet, "entityComponents")
-  
+  let eidSlot = genSym(nskLet, "eidSlot")
+
   result.add nnkLetSection.newTree(
     nnkIdentDefs.newTree(
       entityComponents,
@@ -582,26 +640,21 @@ macro spawnImpl*(w: World, components: varargs[typed]): EntityId =
     )
   )
 
-  result.add nnkCall.newTree(
-    nnkDotExpr.newTree(
-      nnkDotExpr.newTree(
-        w,
-        ident("entities")
-      ),
-      ident("add")
-    ),
-    genEntityCtor(entityComponents, archetype)
+  result.add nnkLetSection.newTree(
+    nnkIdentDefs.newTree(
+      eidSlot,
+      newEmptyNode(),
+      newCall(bindSym("allocEntitySlot"), w),
+    )
   )
 
-  let entityId = nnkCall.newTree(
-    bindSym("EntityId"),
-    newCall(
-      ident("high"),
-      nnkDotExpr.newTree(
-        w,
-        ident("entities")
-      ),
-    )
+  let generationExpr = nnkDotExpr.newTree(eidSlot, ident("generation"))
+  let indexExpr = nnkDotExpr.newTree(eidSlot, ident("index"))
+  let entityId = newCall(bindSym("makeEntityId"), indexExpr, generationExpr)
+
+  result.add nnkAsgn.newTree(
+    nnkBracketExpr.newTree(nnkDotExpr.newTree(w, ident("entities")), indexExpr),
+    genEntityCtor(entityComponents, archetype, generationExpr)
   )
 
   genAssignComponents(w, components, entityId, entityComponents, result)
@@ -610,18 +663,22 @@ macro spawnImpl*(w: World, components: varargs[typed]): EntityId =
 
 
 proc preRemoveEntity(w: World, entity: EntityId) =
-  ## removes all current components of entity, updates index of entity that has replaced these components (due to `del`)
   static: assert typeid(EntityId).int == 0
-  
-  let ent = w.entities[entity.int]
-  let oldComponents = w.archetypes[ent.archetype].addr
-  
-  for comp in oldComponents[].components:
-    comp.remove(comp.data.addr, ent.index, nil)
 
-  let eids = cast[ptr seq[EntityId]](oldComponents[].components[0].data.addr)
-  if ent.index < eids[].len:
-    w.entities[eids[][ent.index].int].index = ent.index
+  let ent = w.entities[entityIndex(entity)]
+  let oldComponents = w.archetypes[ent.archetype].addr
+
+  if w.iterDepth > 0:
+    for comp in oldComponents[].components:
+      comp.moveOut(comp.data.addr, int(ent.index), nil)
+    cast[ptr seq[EntityId]](oldComponents[].components[0].data.addr)[][int(ent.index)] = noEntity
+    inc oldComponents[].tombstoneCount
+  else:
+    for comp in oldComponents[].components:
+      comp.remove(comp.data.addr, int(ent.index), nil)
+    let eids = cast[ptr seq[EntityId]](oldComponents[].components[0].data.addr)
+    if int(ent.index) < eids[].len:
+      w.entities[entityIndex(eids[][int(ent.index)])].index = ent.index
 
 
 macro respawn*(w: World, entity: EntityId, components: varargs[typed]) =
@@ -631,7 +688,8 @@ macro respawn*(w: World, entity: EntityId, components: varargs[typed]) =
   let archetype = archetypeFromSym(components[0..^1])
   let entityComponents = genSym(nskLet, "entityComponents")
   let entityId = genSym(nskLet, "entityId")
-  
+  let savedGen = genSym(nskLet, "savedGen")
+
   result.add nnkLetSection.newTree(
     nnkIdentDefs.newTree(
       entityComponents,
@@ -645,36 +703,44 @@ macro respawn*(w: World, entity: EntityId, components: varargs[typed]) =
     )
   )
 
-  let ctor = genEntityCtor(entityComponents, archetype)
+  let generationExpr = savedGen
+  let ctor = genEntityCtor(entityComponents, archetype, generationExpr)
   result.add quote do:
+    let `savedGen` = `w`.entities[entityIndex(`entityId`)].generation
     preRemoveEntity(`w`, `entityId`)
-    `w`.entities[`entityId`.int] = `ctor`
+    `w`.entities[entityIndex(`entityId`)] = `ctor`
 
   genAssignComponents(w, components, entityId, entityComponents, result)
 
 
 proc despawn*(w: World, entity: EntityId) =
-  w.respawn(entity, DeletedEntity())
+  assert w.isAlive(entity), "despawn called on dead entity"
+  let idx = entityIndex(entity)
+  preRemoveEntity(w, entity)
+  w.entities[idx].generation = int32((int(w.entities[idx].generation) mod 0xFFFF) + 1)
+  w.entities[idx].archetype = @[]
+  w.freeList.add idx
 
 
-proc cleanupDeleted*(w: World) =
-  let deletedType = typeid(DeletedEntity)
+proc compactTombstones(w: World, arh: Archetype) =
+  let rec = w.archetypes[arh].addr
+  if rec[].tombstoneCount == 0: return
+  let eids = cast[ptr seq[EntityId]](rec[].components[0].data.addr)
+  var i = 0
+  while i < eids[].len:
+    if isNoEntity(eids[][i]):
+      for comp in rec[].components:
+        comp.remove(comp.data.addr, i, nil)
+      if i < eids[].len and not isNoEntity(eids[][i]):
+        w.entities[entityIndex(eids[][i])].index = int32(i)
+    else:
+      inc i
+  rec[].tombstoneCount = 0
 
-  # Remove deleted entities from component storage and from `w.entities`.
-  for i in countdown(w.entities.high, 0):
-    if deletedType in w.entities[i].archetype:
-      preRemoveEntity(w, i.EntityId)
-      w.entities.del(i)
 
-      # Entity ids are positional (`EntityId == index in w.entities`),
-      # so all ids above removed index must shift by -1.
-      for _, archetypeRecord in w.archetypes.mpairs:
-        if archetypeRecord.components.len == 0:
-          continue
-        let eids = cast[ptr seq[EntityId]](archetypeRecord.components[0].data.addr)
-        for j in 0..<eids[].len:
-          if eids[][j].int > i:
-            eids[][j] = EntityId(eids[][j].int - 1)
+proc compactAllTombstones*(w: World) =
+  for arh in w.archetypes.keys:
+    compactTombstones(w, arh)
 
 
 proc componentIndexOf(ar: ArchetypeRecord, tid: TypeId): int =
@@ -711,6 +777,7 @@ proc ensureArchetypeRecordForUpdate(
         trace: oldComp.trace,
         destroy: oldComp.destroy,
         remove: oldComp.remove,
+        moveOut: oldComp.moveOut,
       )
 
   var builtRecords: seq[ComponentRecord]
@@ -735,7 +802,7 @@ proc updateEntityArchetype(
   removeArh: Archetype,
   addRecords: seq[proc: ComponentRecord {.nimcall.}],
 ): EntityRecord =
-  let oldEnt = w.entities[entity.int]
+  let oldEnt = w.entities[entityIndex(entity)]
   let oldArh = oldEnt.archetype
   let newArh = ((oldArh.toHashSet + addArh.toHashSet) - removeArh.toHashSet).toSeq.sortedByIt(it.int)
   if newArh == oldArh:
@@ -743,26 +810,38 @@ proc updateEntityArchetype(
 
   let oldComponents = w.archetypes[oldArh].addr
   let newComponents = ensureArchetypeRecordForUpdate(w, oldArh, newArh, addArh, addRecords)
-  let oldIndex = oldEnt.index
+  let oldIndex = int(oldEnt.index)
   let newIndex = cast[ptr seq[EntityId]](newComponents[].components[0].data.addr)[].len
 
-  for oldComp in oldComponents[].components:
-    var moveTo: pointer = nil
-    if oldComp.typ in newArh:
-      let i = componentIndexOf(newComponents[], oldComp.typ)
-      assert i != -1
-      moveTo = newComponents[].components[i].data.addr
-    oldComp.remove(oldComp.data.addr, oldIndex, moveTo)
+  if w.iterDepth > 0:
+    for oldComp in oldComponents[].components:
+      var moveTo: pointer = nil
+      if oldComp.typ in newArh:
+        let i = componentIndexOf(newComponents[], oldComp.typ)
+        assert i != -1
+        moveTo = newComponents[].components[i].data.addr
+      oldComp.moveOut(oldComp.data.addr, oldIndex, moveTo)
+    cast[ptr seq[EntityId]](oldComponents[].components[0].data.addr)[][oldIndex] = noEntity
+    inc oldComponents[].tombstoneCount
+  else:
+    for oldComp in oldComponents[].components:
+      var moveTo: pointer = nil
+      if oldComp.typ in newArh:
+        let i = componentIndexOf(newComponents[], oldComp.typ)
+        assert i != -1
+        moveTo = newComponents[].components[i].data.addr
+      oldComp.remove(oldComp.data.addr, oldIndex, moveTo)
+    let oldEids = cast[ptr seq[EntityId]](oldComponents[].components[0].data.addr)
+    if oldIndex < oldEids[].len:
+      w.entities[entityIndex(oldEids[][oldIndex])].index = int32(oldIndex)
 
-  let oldEids = cast[ptr seq[EntityId]](oldComponents[].components[0].data.addr)
-  if oldIndex < oldEids[].len:
-    w.entities[oldEids[][oldIndex].int].index = oldIndex
-
-  w.entities[entity.int] = EntityRecord(
+  let savedGen = w.entities[entityIndex(entity)].generation
+  w.entities[entityIndex(entity)] = EntityRecord(
     archetype: newArh,
-    index: newIndex,
+    index: int32(newIndex),
+    generation: savedGen,
   )
-  w.entities[entity.int]
+  w.entities[entityIndex(entity)]
 
 
 proc setOrInsertComponent[T](ar: var ArchetypeRecord, idx: int, tid: TypeId, value: sink T) =
@@ -861,7 +940,7 @@ macro update*(w: World, entity: EntityId, bodies: varargs[untyped]) =
 
   for body in addBodies:
     result.add quote do:
-      setOrInsertComponent(`components`[], `ent`.index, typeid(typeof(`body`)), `body`)
+      setOrInsertComponent(`components`[], int(`ent`.index), typeid(typeof(`body`)), `body`)
 
 
 macro spawn*(w: World, bodies: varargs[untyped]): EntityId =
@@ -912,13 +991,13 @@ template removeComponentIf*(w: World, comp, cond) =
 
 proc getComponentPtr(w: World, ent: EntityId, componentTypeId: TypeId, sizeof: int): pointer =
   ## note: this proc is slow
-  let entRec = w.entities[ent.int]
+  let entRec = w.entities[entityIndex(ent)]
   if componentTypeId notin entRec.archetype: raise ValueError.newException("Component not found")
   let i = entRec.archetype.find(componentTypeId)
-  return cast[pointer](cast[int](w.archetypes[entRec.archetype].components[i].data[0].addr) + sizeof * entRec.index)
+  return cast[pointer](cast[int](w.archetypes[entRec.archetype].components[i].data[0].addr) + sizeof * int(entRec.index))
 
 proc hasComponentImpl(w: World, ent: EntityId, componentTypeId: TypeId): bool =
-  componentTypeId in w.entities[ent.int].archetype
+  entityIndex(ent) < w.entities.len and componentTypeId in w.entities[entityIndex(ent)].archetype
   
 
 template `[]`*(w: World, ent: EntityId, componentType: typedesc): auto =
