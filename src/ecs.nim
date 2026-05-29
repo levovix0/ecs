@@ -713,11 +713,16 @@ proc ensureArchetypeRecordForUpdate(
         remove: oldComp.remove,
       )
 
-  var i = 0
+  var builtRecords: seq[ComponentRecord]
+  for makeRecord in addRecords:
+    builtRecords.add makeRecord()
+
   for addComp in addArh:
     if addComp in newArh and componentIndexOf(outAr[], addComp) == -1:
-      outAr[].components.add (addRecords[i])()
-    inc i
+      for ncr in builtRecords:
+        if ncr.typ == addComp:
+          outAr[].components.add ncr
+          break
 
   sort(outAr[].components, proc(a, b: ComponentRecord): int = cmp(a.typ.int, b.typ.int))
   outAr

@@ -165,3 +165,48 @@ test "forEach (CompA|CompB) || default":
   check (eB.int, 20) in results    # falls back to CompB
   check (eAB.int, 30) in results   # CompA preferred over CompB
   check (eNone.int, -1) in results # default when neither present
+
+
+test "update with multiple components simultaneously":
+  type
+    Pos = object
+      x, y: string
+    Vel = object
+      dx, dy: string
+
+  var w = World()
+
+  let e1 = w.spawn(Pos(x: "px", y: "py"))
+  let e2 = w.spawn(Vel(dx: "vx", dy: "vy"))
+
+  
+  w.update e1:
+    Vel(dx: "new_vx", dy: "new_vy")
+
+  check w[e1, Pos].x == "px"
+  check w[e1, Pos].y == "py"
+  check w[e1, Vel].dx == "new_vx"
+  check w[e1, Vel].dy == "new_vy"
+
+
+  w.update e2:
+    Pos(x: "new_px", y: "new_py")
+
+  check w[e2, Vel].dx == "vx"
+  check w[e2, Vel].dy == "vy"
+  check w[e2, Pos].x == "new_px"
+  check w[e2, Pos].y == "new_py"
+
+
+  let e3 = w.spawn(DeletedEntity())
+  w.update e3:
+    Vel(dx: "e3_vx", dy: "e3_vy")
+    Pos(x: "e3_px", y: "e3_py")
+
+  check w[e3, Pos].x == "e3_px"
+  check w[e3, Vel].dx == "e3_vx"
+
+  w.despawn e1
+  w.despawn e2
+  w.despawn e3
+  w.cleanupDeleted()
