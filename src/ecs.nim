@@ -661,9 +661,10 @@ proc archetypeRecordGetter(w: NimNode, components: seq[NimNode]): NimNode =
   )
 
 
-proc genAssignComponents(w: NimNode, components: seq[NimNode], entityId: NimNode, entityComponents: NimNode, res: var NimNode) =
-  let orderRemap = componentOrderRemap(components.map(typeidFromSym))
-  for i, comp in components:
+proc genAssignComponents(w: NimNode, types: seq[NimNode], values: seq[NimNode], entityId: NimNode, entityComponents: NimNode, res: var NimNode) =
+  let orderRemap = componentOrderRemap(types.map(typeidFromSym))
+  for i, typ in types:
+    let val = values[i]
     res.add nnkCall.newTree(
       nnkDotExpr.newTree(
         nnkBracketExpr.newTree(
@@ -678,10 +679,10 @@ proc genAssignComponents(w: NimNode, components: seq[NimNode], entityId: NimNode
         ident("add")
       ),
       (
-        if comp.kind in {nnkSym, nnkIdent} and comp.strVal.eqIdent("EntityId"):
+        if typ.kind in {nnkSym, nnkIdent} and typ.strVal.eqIdent("EntityId"):
           entityId
         else:
-          comp
+          val
       )
     )
 
@@ -732,8 +733,25 @@ proc allocEntitySlot(w: World): tuple[index: int, generation: int32] =
 macro spawnImpl*(w: World, components: varargs[typed]): EntityId =
   result = newStmtList()
 
-  let components = bindSym("EntityId") & components[0..^1]
-  let archetype = archetypeFromSym(components[0..^1])
+  var expandedTypes: seq[NimNode]
+  var expandedValues: seq[NimNode]
+  for comp in components[0..^1]:
+    let ti = comp.getTypeInst()
+    if ti.kind == nnkTupleConstr:
+      let tmp = genSym(nskLet, "tupleComps")
+      result.add nnkLetSection.newTree(
+        nnkIdentDefs.newTree(tmp, newEmptyNode(), comp)
+      )
+      for i in 0..<ti.len:
+        expandedTypes.add ti[i]
+        expandedValues.add nnkBracketExpr.newTree(tmp, newLit(i))
+    else:
+      expandedTypes.add comp
+      expandedValues.add comp
+
+  let compTypes = bindSym("EntityId") & expandedTypes
+  let compValues = bindSym("EntityId") & expandedValues
+  let archetype = archetypeFromSym(compTypes[0..^1])
   let entityComponents = genSym(nskLet, "entityComponents")
   let eidSlot = genSym(nskLet, "eidSlot")
 
@@ -741,7 +759,7 @@ macro spawnImpl*(w: World, components: varargs[typed]): EntityId =
     nnkIdentDefs.newTree(
       entityComponents,
       newEmptyNode(),
-      archetypeRecordGetter(w, components),
+      archetypeRecordGetter(w, compTypes),
     )
   )
 
@@ -762,7 +780,7 @@ macro spawnImpl*(w: World, components: varargs[typed]): EntityId =
     genEntityCtor(entityComponents, archetype, generationExpr)
   )
 
-  genAssignComponents(w, components, entityId, entityComponents, result)
+  genAssignComponents(w, compTypes, compValues, entityId, entityComponents, result)
 
   result.add entityId
 
@@ -840,7 +858,7 @@ macro respawn*(w: World, entity: EntityId, components: varargs[typed]) =
     preRemoveEntity(`w`, `entityId`)
     `w`.entities[entityIndex(`entityId`)] = `ctor`
 
-  genAssignComponents(w, components, entityId, entityComponents, result)
+  genAssignComponents(w, components, components, entityId, entityComponents, result)
 
 
 proc despawn*(w: World, entity: EntityId) =
@@ -1075,32 +1093,25 @@ macro update*(w: World, entity: EntityId, bodies: varargs[untyped]) =
       setOrInsertComponent(`components`[], int(`ent`.index), typeid(typeof(`body`)), `body`)
 
 
+proc addBodyToCall(call: NimNode, body: NimNode) =
+  if body.kind == nnkTupleConstr:
+    for elem in body: call.add elem
+  elif body.kind == nnkStmtList:
+    for x in body: call.addBodyToCall(x)
+  else:
+    call.add body
+
 macro spawn*(w: World, bodies: varargs[untyped]): EntityId =
   result = newCall(bindSym("spawnImpl"), w)
-  for body in bodies:
-    if body.kind == nnkStmtList:
-      for x in body:
-        result.add x
-    else:
-      result.add body
+  for body in bodies: result.addBodyToCall(body)
 
 macro makeEntity*(w: World, bodies: varargs[untyped]): EntityId =
   result = newCall(bindSym("spawnImpl"), w)
-  for body in bodies:
-    if body.kind == nnkStmtList:
-      for x in body:
-        result.add x
-    else:
-      result.add body
+  for body in bodies: result.addBodyToCall(body)
 
 macro add*(w: World, bodies: varargs[untyped]) =
   result = newCall(bindSym("spawnImpl"), w)
-  for body in bodies:
-    if body.kind == nnkStmtList:
-      for x in body:
-        result.add x
-    else:
-      result.add body
+  for body in bodies: result.addBodyToCall(body)
   result = nnkDiscardStmt.newTree(result)
 
 

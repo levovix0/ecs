@@ -359,3 +359,27 @@ test "clone during forEach":
   check cloneVals.len == 2
   check 1 in cloneVals
   check 2 in cloneVals
+
+
+test "anonymous tuple unpacking":
+  type
+    TComp1 = object
+      x: int
+    TComp2 = object
+      y: float
+
+  var w = World()
+
+  let literal = w.spawn (TComp1(x: 1), TComp2(y: 2.0))
+  check w[literal, TComp1].x == 1
+  check w[literal, TComp2].y == 2.0
+
+  let tup = (TComp1(x: 3), TComp2(y: 4.0))
+  let fromVar = w.spawn tup
+  check w[fromVar, TComp1].x == 3
+  check w[fromVar, TComp2].y == 4.0
+
+  type NamedPair = tuple[a: TComp1, b: TComp2]
+  let named: NamedPair = (TComp1(x: 5), TComp2(y: 6.0))
+  let fromNamed = w.spawn named
+  check w[fromNamed, NamedPair].a.x == 5

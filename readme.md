@@ -1,6 +1,6 @@
 # Ecs
 
-Simple entity-component-system pattern implementation for Nim in ~1000 lines of code, without dependecies
+Simple entity-component-system pattern implementation for Nim in ~1500 lines of code, without dependecies
 
 ## Example
 
