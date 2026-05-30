@@ -1,4 +1,5 @@
 import std/[tables, macros, strutils, algorithm, sequtils, hashes, macrocache, sets]
+import std/typetraits
 export tables.hasKey, tables.`[]`
 
 type
@@ -17,12 +18,15 @@ type
     ## packed (index: int32, generation: int16) handle to an entity
 
   ComponentRecord* = object
-    data*: seq[byte]
+    data*: pointer     ## raw element buffer; cap*elementSize bytes allocated
+    len*: int          ## element count
+    cap*: int          ## allocated capacity in elements
+    elementSize*: int  ## sizeof(T)
     typ*: TypeId
-    trace*: proc(arr: pointer, env: pointer) {.nimcall.}
-    destroy*: proc(arr: pointer) {.nimcall.}
-    remove*: proc(arr: pointer, i: int, moveTo: pointer) {.nimcall.}
-    moveOut*: proc(arr: pointer, i: int, moveTo: pointer) {.nimcall.}
+    trace*: proc(rec: ptr ComponentRecord, env: pointer) {.nimcall.}
+    destroy*: proc(rec: ptr ComponentRecord) {.nimcall.}
+    remove*: proc(rec: ptr ComponentRecord, i: int, moveTo: ptr ComponentRecord) {.nimcall.}
+    moveOut*: proc(rec: ptr ComponentRecord, i: int, moveTo: ptr ComponentRecord) {.nimcall.}
 
   ArchetypeRecord* = object
     components*: seq[ComponentRecord]
@@ -30,8 +34,7 @@ type
     # todo: optimize for zero-sized components (flags)
 
   ComponentsQueries* = seq[ComponentsQuery]
-  ComponentsQuery* = seq[pointer]
-    ## pointers to seq[T], where T is the type of the component.
+  ComponentsQuery* = seq[ptr ComponentRecord]
     ## len is same as count of types in archetype, order is based on component type ids.
 
   World* = ref object
@@ -213,12 +216,25 @@ proc componentOrderRemap(typs: seq[int]): seq[int] =
 
 
 proc `=trace`(x: var ComponentRecord, env: pointer) =
-  if x.trace != nil:
-    x.trace(x.data.addr, env)
+  if x.trace != nil: x.trace(x.addr, env)
 
 proc `=destroy`(x: ComponentRecord) {.raises: [Exception].} =
   if x.destroy != nil:
-    x.destroy(x.data.addr)
+    x.destroy(x.addr)
+  elif x.data != nil:
+    dealloc(x.data)
+
+proc `=copy`(dst: var ComponentRecord, src: ComponentRecord) =
+  dst.elementSize = src.elementSize
+  dst.typ = src.typ
+  dst.trace = src.trace; dst.destroy = src.destroy
+  dst.remove = src.remove; dst.moveOut = src.moveOut
+  dst.data = nil; dst.len = 0; dst.cap = 0
+  if src.len > 0:
+    assert src.trace == nil, "=copy of non-trivially copyable ComponentRecord not supported"
+    dst.data = alloc(src.len * src.elementSize)
+    copyMem(dst.data, src.data, src.len * src.elementSize)
+    dst.len = src.len; dst.cap = src.len
 
 
 proc componentQueryAll*(w: World, tc: Archetype): ComponentsQueries =
@@ -227,7 +243,7 @@ proc componentQueryAll*(w: World, tc: Archetype): ComponentsQueries =
       var query: ComponentsQuery
       for comp in v.components.mitems:
         if comp.typ in tc:
-          query.add comp.data.addr
+          query.add comp.addr
       result.add query
 
 
@@ -239,7 +255,7 @@ proc componentQueryAllWithOptional*(w: World, cond: proc(arh: Archetype): bool, 
         block find:
           for comp in v.components.mitems:
             if comp.typ == typ:
-              query.add comp.data.addr
+              query.add comp.addr
               break find
           # else
           query.add nil
@@ -252,13 +268,13 @@ proc queryHas_impl(q: ComponentsQuery, qarh: static Archetype, tid: static TypeI
 
 proc queryThe_impl[T](q: ComponentsQuery, qarh: static Archetype, tid: static TypeId, entIdx: int): var T =
   const i = qarh.find(tid)
-  return cast[ptr seq[T]](q[i])[][entIdx]
+  return cast[ptr UncheckedArray[T]](q[i][].data)[][entIdx]
 
 
 proc queryItemCount(q: ComponentsQuery): int =
   for arr in q:
     if arr != nil:
-      return cast[ptr seq[byte]](arr)[].len  # seq[byte] should return same len as seq[`varType`]
+      return arr[].len
 
 
 
@@ -369,7 +385,7 @@ macro forEach*(w: World, query: untyped, body: untyped) =
         if hasDefaultValue and varType.kind == nnkVarTy:
           error("defaulted component bindings do not support `var` components", n)
         
-        let castedValue = quote do: cast[ptr seq[`seqType`]](`cquery`[static(find(`carh`, typeid(`varType`)))])[][`idx`]
+        let castedValue = quote do: cast[ptr UncheckedArray[`seqType`]](`cquery`[static(find(`carh`, typeid(`varType`)))][].data)[][`idx`]
         let nameN = n[0]
         if hasDefaultValue:
           let orTypes = collectOrTypes(queryPart)
@@ -379,14 +395,14 @@ macro forEach*(w: World, query: untyped, body: untyped) =
               let t = orTypes[i]
               let prevChain = chainExpr
               chainExpr = quote do:
-                (if queryHas_impl(`cquery`, `carh`, typeid(`t`)): cast[ptr seq[`seqType`]](`cquery`[static(find(`carh`, typeid(`t`)))])[][`idx`] else: `prevChain`)
+                (if queryHas_impl(`cquery`, `carh`, typeid(`t`)): cast[ptr UncheckedArray[`seqType`]](`cquery`[static(find(`carh`, typeid(`t`)))][].data)[][`idx`] else: `prevChain`)
             outVars[name] = quoteWithoutLineInfo do:
               let `nameN`: `varType` = `chainExpr`
           else:
             outVars[name] = quoteWithoutLineInfo do:
               let `nameN`: `varType` =
                 if has(`varType`):
-                  cast[ptr seq[`seqType`]](`cquery`[static(find(`carh`, typeid(`varType`)))])[][`idx`]
+                  cast[ptr UncheckedArray[`seqType`]](`cquery`[static(find(`carh`, typeid(`varType`)))][].data)[][`idx`]
                 else:
                   `defaultValue`
         else:
@@ -447,7 +463,7 @@ macro forEach*(w: World, query: untyped, body: untyped) =
         while `outerIdx` < queryItemCount(`cquery`):
           let `idx` = `outerIdx`
           inc `outerIdx`
-          if isNoEntity(cast[ptr seq[EntityId]](`cquery`[0])[][`idx`]): continue
+          if isNoEntity(cast[ptr UncheckedArray[EntityId]](`cquery`[0][].data)[][`idx`]): continue
           `vars`
           block:
             `body`
@@ -472,58 +488,123 @@ template getOrCreateArchetypeRecord(w: World, archetype: Archetype, orCreate: Ar
     nil
 
 
-proc doTrace[T](arr: var seq[T], env: pointer) {.nimcall.} =
-  `=trace`(arr, env)
+proc doTraceElem[T](x: var T, env: pointer) {.inline.} =
+  `=trace`(x, env)
 
-proc doDestroy[T](arr: var seq[T]) {.nimcall.} =
-  `=destroy`(arr)
+proc doDestroyElem[T](x: var T) {.inline.} =
+  `=destroy`(x)
+
+proc compRecEnsureCap(r: ptr ComponentRecord, newLen: int) =
+  if newLen > r.cap:
+    let newCap = max(newLen, max(r.cap * 2, 4))
+    r.data = realloc0(r.data, r.cap * r.elementSize, newCap * r.elementSize)
+    r.cap = newCap
+
+proc genericRemove(rec: ptr ComponentRecord, i: int, moveTo: ptr ComponentRecord) {.nimcall.} =
+  let src = rec
+  let es = src.elementSize
+  if moveTo != nil:
+    let dst = moveTo
+    compRecEnsureCap(dst, dst.len + 1)
+    copyMem(cast[pointer](cast[int](dst.data) + dst.len * es),
+            cast[pointer](cast[int](src.data) + i * es), es)
+    dst.len += 1
+  if i != src.len - 1:
+    copyMem(cast[pointer](cast[int](src.data) + i * es),
+            cast[pointer](cast[int](src.data) + (src.len - 1) * es), es)
+  src.len -= 1
+
+proc genericMoveOut(rec: ptr ComponentRecord, i: int, moveTo: ptr ComponentRecord) {.nimcall.} =
+  let src = rec
+  let es = src.elementSize
+  if moveTo != nil:
+    let dst = moveTo
+    compRecEnsureCap(dst, dst.len + 1)
+    copyMem(cast[pointer](cast[int](dst.data) + dst.len * es),
+            cast[pointer](cast[int](src.data) + i * es), es)
+    dst.len += 1
+
+proc callRemove(comp: ptr ComponentRecord, i: int, moveTo: ptr ComponentRecord) {.inline.} =
+  if comp.remove != nil: comp.remove(comp, i, moveTo)
+  else: genericRemove(comp, i, moveTo)
+
+proc callMoveOut(comp: ptr ComponentRecord, i: int, moveTo: ptr ComponentRecord) {.inline.} =
+  if comp.moveOut != nil: comp.moveOut(comp, i, moveTo)
+  else: genericMoveOut(comp, i, moveTo)
 
 
 macro componentRecordConstructorFromSym(x: typed): ComponentRecord =
   let typ = x.getRuntimeTypeInst
+  let tid = newCall(bindSym("TypeId"), newLit(typeidFromSym(x)))
 
-  result = nnkObjConstr.newTree(
+  let trivialBranch = nnkObjConstr.newTree(
     bindSym("ComponentRecord"),
-    # typ*: TypeId
-    nnkExprColonExpr.newTree(
-      ident("typ"), newCall(bindSym("TypeId"), newLit(typeidFromSym(x)))
-    ),
-    # trace*: proc(arr: pointer, env: pointer) {.nimcall.}
+    nnkExprColonExpr.newTree(ident("elementSize"), newCall(bindSym("sizeof"), typ)),
+    nnkExprColonExpr.newTree(ident("typ"), tid),
+  )
+
+  let fullBranch = nnkObjConstr.newTree(
+    bindSym("ComponentRecord"),
+    nnkExprColonExpr.newTree(ident("elementSize"), newCall(bindSym("sizeof"), typ)),
+    nnkExprColonExpr.newTree(ident("typ"), tid),
     nnkExprColonExpr.newTree(
       ident("trace"), (quote do:
-        proc(arr: pointer, env: pointer) {.nimcall.} =
-          doTrace(cast[ptr seq[`typ`]](arr)[], env)
+        proc(rec: ptr ComponentRecord, env: pointer) {.nimcall.} =
+          var i = 0
+          while i < rec.len:
+            doTraceElem(cast[ptr `typ`](cast[int](rec.data) + i * sizeof(`typ`))[], env)
+            inc i
       )
     ),
-    # destroy*: proc(arr: pointer) {.nimcall.}
     nnkExprColonExpr.newTree(
       ident("destroy"), (quote do:
-        proc(arr: pointer) {.nimcall.} =
-          doDestroy(cast[ptr seq[`typ`]](arr)[])
+        proc(rec: ptr ComponentRecord) {.nimcall.} =
+          var i = 0
+          while i < rec.len:
+            doDestroyElem(cast[ptr `typ`](cast[int](rec.data) + i * sizeof(`typ`))[])
+            inc i
+          if rec.data != nil: dealloc(rec.data)
+          rec.data = nil; rec.len = 0; rec.cap = 0
       )
     ),
-    # remove*: proc(arr: pointer, i: int, moveTo: pointer) {.nimcall.}
     nnkExprColonExpr.newTree(
       ident("remove"), (quote do:
-        proc(arr: pointer, i: int, moveTo: pointer) {.nimcall.} =
+        proc(rec: ptr ComponentRecord, i: int, moveTo: ptr ComponentRecord) {.nimcall.} =
+          let srcArr = cast[ptr UncheckedArray[`typ`]](rec.data)
           if moveTo != nil:
-            cast[ptr seq[`typ`]](moveTo)[].add move(cast[ptr seq[`typ`]](arr)[][i])
-          cast[ptr seq[`typ`]](arr)[].del i
+            let dst = moveTo
+            compRecEnsureCap(dst, dst.len + 1)
+            cast[ptr UncheckedArray[`typ`]](dst.data)[][dst.len] = move srcArr[][i]
+            dst.len += 1
+          if i != rec.len - 1: srcArr[][i] = move srcArr[][rec.len - 1]
+          doDestroyElem(srcArr[][rec.len - 1])
+          rec.len -= 1
       )
     ),
-    # moveOut*: proc(arr: pointer, i: int, moveTo: pointer) {.nimcall.}
     nnkExprColonExpr.newTree(
       ident("moveOut"), (quote do:
-        proc(arr: pointer, i: int, moveTo: pointer) {.nimcall.} =
+        proc(rec: ptr ComponentRecord, i: int, moveTo: ptr ComponentRecord) {.nimcall.} =
+          let srcArr = cast[ptr UncheckedArray[`typ`]](rec.data)
           if moveTo != nil:
-            cast[ptr seq[`typ`]](moveTo)[].add move(cast[ptr seq[`typ`]](arr)[][i])
+            let dst = moveTo
+            compRecEnsureCap(dst, dst.len + 1)
+            cast[ptr UncheckedArray[`typ`]](dst.data)[][dst.len] = move srcArr[][i]
+            dst.len += 1
       )
     ),
   )
 
+  let trivialCond = newCall(bindSym("supportsCopyMem"), nnkBracketExpr.newTree(ident("typedesc"), typ))
+  result = nnkWhenStmt.newTree(
+    nnkElifBranch.newTree(trivialCond, trivialBranch),
+    nnkElse.newTree(fullBranch)
+  )
 
-proc add*[T](wc: var ComponentRecord, data: T) =
-  cast[ptr seq[T]](wc.data.addr)[].add(data)
+
+proc add*[T](wc: var ComponentRecord, val: T) =
+  compRecEnsureCap(wc.addr, wc.len + 1)
+  cast[ptr T](cast[int](wc.data) + wc.len * sizeof(T))[] = val
+  wc.len += 1
 
 
 proc archetypeRecordGetter(w: NimNode, components: seq[NimNode]): NimNode =
@@ -592,17 +673,14 @@ proc genEntityCtor(entityComponents: NimNode, archetype: Archetype, generationEx
         ident("index"),
         newCall(bindSym("int32"),
           nnkDotExpr.newTree(
-            nnkDotExpr.newTree(
-              nnkBracketExpr.newTree(
-                nnkDotExpr.newTree(
-                  nnkBracketExpr.newTree(
-                    entityComponents
-                  ),
-                  ident("components")
+            nnkBracketExpr.newTree(
+              nnkDotExpr.newTree(
+                nnkBracketExpr.newTree(
+                  entityComponents
                 ),
-                newLit(0)
+                ident("components")
               ),
-              ident("data")
+              newLit(0)
             ),
             ident("len")
           )
@@ -669,16 +747,16 @@ proc preRemoveEntity(w: World, entity: EntityId) =
   let oldComponents = w.archetypes[ent.archetype].addr
 
   if w.iterDepth > 0:
-    for comp in oldComponents[].components:
-      comp.moveOut(comp.data.addr, int(ent.index), nil)
-    cast[ptr seq[EntityId]](oldComponents[].components[0].data.addr)[][int(ent.index)] = noEntity
+    for comp in oldComponents[].components.mitems:
+      callMoveOut(comp.addr, int(ent.index), nil)
+    cast[ptr UncheckedArray[EntityId]](oldComponents[].components[0].data)[][int(ent.index)] = noEntity
     inc oldComponents[].tombstoneCount
   else:
-    for comp in oldComponents[].components:
-      comp.remove(comp.data.addr, int(ent.index), nil)
-    let eids = cast[ptr seq[EntityId]](oldComponents[].components[0].data.addr)
-    if int(ent.index) < eids[].len:
-      w.entities[entityIndex(eids[][int(ent.index)])].index = ent.index
+    for comp in oldComponents[].components.mitems:
+      callRemove(comp.addr, int(ent.index), nil)
+    let eids = cast[ptr UncheckedArray[EntityId]](oldComponents[].components[0].data)
+    if int(ent.index) < oldComponents[].components[0].len:
+      w.entities[entityIndex(eids[int(ent.index)])].index = ent.index
 
 
 macro respawn*(w: World, entity: EntityId, components: varargs[typed]) =
@@ -725,14 +803,14 @@ proc despawn*(w: World, entity: EntityId) =
 proc compactTombstones(w: World, arh: Archetype) =
   let rec = w.archetypes[arh].addr
   if rec[].tombstoneCount == 0: return
-  let eids = cast[ptr seq[EntityId]](rec[].components[0].data.addr)
   var i = 0
-  while i < eids[].len:
-    if isNoEntity(eids[][i]):
-      for comp in rec[].components:
-        comp.remove(comp.data.addr, i, nil)
-      if i < eids[].len and not isNoEntity(eids[][i]):
-        w.entities[entityIndex(eids[][i])].index = int32(i)
+  while i < rec[].components[0].len:
+    let eids = cast[ptr UncheckedArray[EntityId]](rec[].components[0].data)
+    if isNoEntity(eids[i]):
+      for comp in rec[].components.mitems:
+        callRemove(comp.addr, i, nil)
+      if i < rec[].components[0].len and not isNoEntity(cast[ptr UncheckedArray[EntityId]](rec[].components[0].data)[i]):
+        w.entities[entityIndex(cast[ptr UncheckedArray[EntityId]](rec[].components[0].data)[i])].index = int32(i)
     else:
       inc i
   rec[].tombstoneCount = 0
@@ -772,7 +850,7 @@ proc ensureArchetypeRecordForUpdate(
   for oldComp in oldComponents[]:
     if oldComp.typ in newArh:
       outAr[].components.add ComponentRecord(
-        data: @[],
+        elementSize: oldComp.elementSize,
         typ: oldComp.typ,
         trace: oldComp.trace,
         destroy: oldComp.destroy,
@@ -811,29 +889,31 @@ proc updateEntityArchetype(
   let oldComponents = w.archetypes[oldArh].addr
   let newComponents = ensureArchetypeRecordForUpdate(w, oldArh, newArh, addArh, addRecords)
   let oldIndex = int(oldEnt.index)
-  let newIndex = cast[ptr seq[EntityId]](newComponents[].components[0].data.addr)[].len
+  let newIndex = newComponents[].components[0].len
 
   if w.iterDepth > 0:
-    for oldComp in oldComponents[].components:
-      var moveTo: pointer = nil
-      if oldComp.typ in newArh:
-        let i = componentIndexOf(newComponents[], oldComp.typ)
-        assert i != -1
-        moveTo = newComponents[].components[i].data.addr
-      oldComp.moveOut(oldComp.data.addr, oldIndex, moveTo)
-    cast[ptr seq[EntityId]](oldComponents[].components[0].data.addr)[][oldIndex] = noEntity
+    for oldComp in oldComponents[].components.mitems:
+      let moveTo =
+        if oldComp.typ in newArh:
+          let i = componentIndexOf(newComponents[], oldComp.typ)
+          assert i != -1
+          newComponents[].components[i].addr
+        else: nil
+      callMoveOut(oldComp.addr, oldIndex, moveTo)
+    cast[ptr UncheckedArray[EntityId]](oldComponents[].components[0].data)[][oldIndex] = noEntity
     inc oldComponents[].tombstoneCount
   else:
-    for oldComp in oldComponents[].components:
-      var moveTo: pointer = nil
-      if oldComp.typ in newArh:
-        let i = componentIndexOf(newComponents[], oldComp.typ)
-        assert i != -1
-        moveTo = newComponents[].components[i].data.addr
-      oldComp.remove(oldComp.data.addr, oldIndex, moveTo)
-    let oldEids = cast[ptr seq[EntityId]](oldComponents[].components[0].data.addr)
-    if oldIndex < oldEids[].len:
-      w.entities[entityIndex(oldEids[][oldIndex])].index = int32(oldIndex)
+    for oldComp in oldComponents[].components.mitems:
+      let moveTo =
+        if oldComp.typ in newArh:
+          let i = componentIndexOf(newComponents[], oldComp.typ)
+          assert i != -1
+          newComponents[].components[i].addr
+        else: nil
+      callRemove(oldComp.addr, oldIndex, moveTo)
+    let eids = cast[ptr UncheckedArray[EntityId]](oldComponents[].components[0].data)
+    if oldIndex < oldComponents[].components[0].len:
+      w.entities[entityIndex(eids[oldIndex])].index = int32(oldIndex)
 
   let savedGen = w.entities[entityIndex(entity)].generation
   w.entities[entityIndex(entity)] = EntityRecord(
@@ -848,11 +928,11 @@ proc setOrInsertComponent[T](ar: var ArchetypeRecord, idx: int, tid: TypeId, val
   let i = componentIndexOf(ar, tid)
   assert i != -1, "component was not found in destination archetype"
 
-  let arr = cast[ptr seq[T]](ar.components[i].data.addr)
-  if arr[].len == idx:
-    arr[].add value
-  elif idx < arr[].len:
-    arr[][idx] = value
+  let comp = ar.components[i].addr
+  if comp.len == idx:
+    comp[].add value
+  elif idx < comp.len:
+    cast[ptr UncheckedArray[T]](comp.data)[][idx] = value
   else:
     assert false, "component array is out of sync with entity indices"
 
@@ -994,7 +1074,7 @@ proc getComponentPtr(w: World, ent: EntityId, componentTypeId: TypeId, sizeof: i
   let entRec = w.entities[entityIndex(ent)]
   if componentTypeId notin entRec.archetype: raise ValueError.newException("Component not found")
   let i = entRec.archetype.find(componentTypeId)
-  return cast[pointer](cast[int](w.archetypes[entRec.archetype].components[i].data[0].addr) + sizeof * int(entRec.index))
+  return cast[pointer](cast[int](w.archetypes[entRec.archetype].components[i].data) + sizeof * int(entRec.index))
 
 proc hasComponentImpl(w: World, ent: EntityId, componentTypeId: TypeId): bool =
   entityIndex(ent) < w.entities.len and componentTypeId in w.entities[entityIndex(ent)].archetype
