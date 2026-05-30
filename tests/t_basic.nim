@@ -294,3 +294,68 @@ test "nested forEach":
   check (1, 20) in pairs
   check (2, 10) in pairs
   check (2, 20) in pairs
+
+
+test "clone":
+  type
+    CPos = object
+      x, y: int
+    CLabel = object
+      name: string
+
+  var w = World()
+
+  let src = w.spawn(CPos(x: 3, y: 7), CLabel(name: "hello"))
+  let dst = w.clone(src)
+
+  check w.isAlive(dst)
+  check dst != src
+
+  var srcPos, dstPos: CPos
+  var srcLabel, dstLabel: CLabel
+
+  w.forEach (id: EntityId, p: CPos, l: CLabel):
+    if id == src:
+      srcPos = p; srcLabel = l
+    elif id == dst:
+      dstPos = p; dstLabel = l
+
+  check srcPos == dstPos
+  check srcLabel.name == dstLabel.name
+
+  w.update(dst, CPos(x: 99, y: 99))
+  w.forEach (id: EntityId, p: CPos):
+    if id == src: check p.x == 3
+    if id == dst: check p.x == 99
+
+  dstLabel.name = "world"
+  check srcLabel.name == "hello"
+
+
+test "clone during forEach":
+  type
+    CVf = object
+      n: int
+    ClonedTag = object
+
+  var w = World()
+  discard w.spawn(CVf(n: 1))
+  discard w.spawn(CVf(n: 2))
+
+  var clones: seq[EntityId]
+  w.forEach (id: EntityId, v: CVf):
+    let c = w.clone(id)
+    w.update(c, ClonedTag())  # move clone to different archetype — leaves tombstone, stops re-visiting
+    clones.add c
+
+  check clones.len == 2
+  for c in clones:
+    check w.isAlive(c)
+
+  var cloneVals: seq[int]
+  w.forEach (v: CVf, ClonedTag):
+    cloneVals.add v.n
+  
+  check cloneVals.len == 2
+  check 1 in cloneVals
+  check 2 in cloneVals

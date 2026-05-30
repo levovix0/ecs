@@ -27,6 +27,7 @@ type
     destroy*: proc(rec: ptr ComponentRecord) {.nimcall.}
     remove*: proc(rec: ptr ComponentRecord, i: int, moveTo: ptr ComponentRecord) {.nimcall.}
     moveOut*: proc(rec: ptr ComponentRecord, i: int, moveTo: ptr ComponentRecord) {.nimcall.}
+    copy*: proc(rec: ptr ComponentRecord, srcIdx: int, dst: ptr ComponentRecord) {.nimcall.}
 
   ArchetypeRecord* = object
     components*: seq[ComponentRecord]
@@ -532,6 +533,17 @@ proc callMoveOut(comp: ptr ComponentRecord, i: int, moveTo: ptr ComponentRecord)
   if comp.moveOut != nil: comp.moveOut(comp, i, moveTo)
   else: genericMoveOut(comp, i, moveTo)
 
+proc genericCopy(rec: ptr ComponentRecord, srcIdx: int, dst: ptr ComponentRecord) {.nimcall.} =
+  let es = rec.elementSize
+  compRecEnsureCap(dst, dst.len + 1)
+  copyMem(cast[pointer](cast[int](dst.data) + dst.len * es),
+          cast[pointer](cast[int](rec.data) + srcIdx * es), es)
+  dst.len += 1
+
+proc callCopy(comp: ptr ComponentRecord, srcIdx: int, dst: ptr ComponentRecord) {.inline.} =
+  if comp.copy != nil: comp.copy(comp, srcIdx, dst)
+  else: genericCopy(comp, srcIdx, dst)
+
 
 macro componentRecordConstructorFromSym(x: typed): ComponentRecord =
   let typ = x.getRuntimeTypeInst
@@ -547,6 +559,8 @@ macro componentRecordConstructorFromSym(x: typed): ComponentRecord =
     bindSym("ComponentRecord"),
     nnkExprColonExpr.newTree(ident("elementSize"), newCall(bindSym("sizeof"), typ)),
     nnkExprColonExpr.newTree(ident("typ"), tid),
+    
+    # trace*: proc(rec: ptr ComponentRecord, env: pointer) {.nimcall.}
     nnkExprColonExpr.newTree(
       ident("trace"), (quote do:
         proc(rec: ptr ComponentRecord, env: pointer) {.nimcall.} =
@@ -556,6 +570,7 @@ macro componentRecordConstructorFromSym(x: typed): ComponentRecord =
             inc i
       )
     ),
+    # destroy*: proc(rec: ptr ComponentRecord) {.nimcall.}
     nnkExprColonExpr.newTree(
       ident("destroy"), (quote do:
         proc(rec: ptr ComponentRecord) {.nimcall.} =
@@ -567,6 +582,7 @@ macro componentRecordConstructorFromSym(x: typed): ComponentRecord =
           rec.data = nil; rec.len = 0; rec.cap = 0
       )
     ),
+    # remove*: proc(rec: ptr ComponentRecord, i: int, dst: ptr ComponentRecord) {.nimcall.}
     nnkExprColonExpr.newTree(
       ident("remove"), (quote do:
         proc(rec: ptr ComponentRecord, i: int, moveTo: ptr ComponentRecord) {.nimcall.} =
@@ -581,6 +597,7 @@ macro componentRecordConstructorFromSym(x: typed): ComponentRecord =
           rec.len -= 1
       )
     ),
+    # moveOut*: proc(rec: ptr ComponentRecord, i: int, moveTo: ptr ComponentRecord) {.nimcall.}
     nnkExprColonExpr.newTree(
       ident("moveOut"), (quote do:
         proc(rec: ptr ComponentRecord, i: int, moveTo: ptr ComponentRecord) {.nimcall.} =
@@ -590,6 +607,16 @@ macro componentRecordConstructorFromSym(x: typed): ComponentRecord =
             compRecEnsureCap(dst, dst.len + 1)
             cast[ptr UncheckedArray[`typ`]](dst.data)[][dst.len] = move srcArr[][i]
             dst.len += 1
+      )
+    ),
+    # copy*: proc(rec: ptr ComponentRecord, i: int, dst: ptr ComponentRecord) {.nimcall.}
+    nnkExprColonExpr.newTree(
+      ident("copy"), (quote do:
+        proc(rec: ptr ComponentRecord, srcIdx: int, dst: ptr ComponentRecord) {.nimcall.} =
+          compRecEnsureCap(dst, dst.len + 1)
+          cast[ptr UncheckedArray[`typ`]](dst.data)[][dst.len] =
+            cast[ptr UncheckedArray[`typ`]](rec.data)[][srcIdx]
+          dst.len += 1
       )
     ),
   )
@@ -757,6 +784,31 @@ proc preRemoveEntity(w: World, entity: EntityId) =
     let eids = cast[ptr UncheckedArray[EntityId]](oldComponents[].components[0].data)
     if int(ent.index) < oldComponents[].components[0].len:
       w.entities[entityIndex(eids[int(ent.index)])].index = ent.index
+
+
+proc clone*(w: World, entity: EntityId): EntityId =
+  assert w.isAlive(entity)
+  let srcRecord = w.entities[entityIndex(entity)]
+  let archetype = srcRecord.archetype
+  let compIdx = int(srcRecord.index)
+
+  let eidSlot = allocEntitySlot(w)
+  let newEntityId = makeEntityId(eidSlot.index, eidSlot.generation)
+
+  let arcRec = w.archetypes[archetype].addr
+  let newCompIdx = arcRec[].components[0].len
+
+  w.entities[eidSlot.index] = EntityRecord(
+    archetype: archetype,
+    index: int32(newCompIdx),
+    generation: eidSlot.generation,
+  )
+
+  arcRec[].components[0].add(newEntityId)
+  for i in 1..<arcRec[].components.len:
+    callCopy(arcRec[].components[i].addr, compIdx, arcRec[].components[i].addr)
+
+  newEntityId
 
 
 macro respawn*(w: World, entity: EntityId, components: varargs[typed]) =
