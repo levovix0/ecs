@@ -829,6 +829,46 @@ proc clone*(w: World, entity: EntityId): EntityId =
   newEntityId
 
 
+proc teleportClone*(dest, src: World, entity: EntityId): EntityId =
+  ## copies an entity, with all of its components, from the `src` world into the `dest` world,
+  ## returning the new entity's id in `dest`. `src` is left unchanged.
+  assert src.isAlive(entity)
+  let srcRecord = src.entities[entityIndex(entity)]
+  let archetype = srcRecord.archetype
+  let srcCompIdx = int(srcRecord.index)
+  let srcArc = src.archetypes[archetype].addr
+
+  # ensure `dest` has an archetype record matching `src`'s; the component function
+  let destArc = dest.archetypes.mgetOrPut(archetype, ArchetypeRecord()).addr
+  if destArc[].components.len == 0:
+    for c in srcArc[].components:
+      destArc[].components.add ComponentRecord(
+        elementSize: c.elementSize,
+        typ: c.typ,
+        trace: c.trace,
+        destroy: c.destroy,
+        remove: c.remove,
+        moveOut: c.moveOut,
+        copy: c.copy,
+      )
+
+  let eidSlot = allocEntitySlot(dest)
+  let newEntityId = makeEntityId(eidSlot.index, eidSlot.generation)
+  let newCompIdx = destArc[].components[0].len
+
+  dest.entities[eidSlot.index] = EntityRecord(
+    archetype: archetype,
+    index: int32(newCompIdx),
+    generation: eidSlot.generation,
+  )
+
+  destArc[].components[0].add(newEntityId)
+  for i in 1..<srcArc[].components.len:
+    callCopy(srcArc[].components[i].addr, srcCompIdx, destArc[].components[i].addr)
+
+  newEntityId
+
+
 macro respawn*(w: World, entity: EntityId, components: varargs[typed]) =
   result = newStmtList()
 
