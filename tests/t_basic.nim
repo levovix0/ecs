@@ -130,14 +130,18 @@ test "basic ecs":
       echo "[", i, "] ", t
 
 
-test "forEach (CompA|CompB) || default":
-  type
-    CompA = object
-      val: int
-    CompB = object
-      val: int
-    Tag = object
+type
+  CompA = object
+    val: int
+  CompB = object
+    val: int
+  Tag = object
 
+## a union binding `x: CompA|CompB` resolves to the first listed type (CompA);
+## the other listed types are implicitly converted to it via converters
+converter toCompA(b: CompB): CompA {.used.} = CompA(val: b.val)
+
+test "forEach (CompA|CompB) || default":
   var w = World()
 
   let eA = w.spawn(CompA(val: 10))

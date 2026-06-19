@@ -385,28 +385,47 @@ macro forEach*(w: World, query: untyped, body: untyped) =
           error("expected component type", n)
         if hasDefaultValue and varType.kind == nnkVarTy:
           error("defaulted component bindings do not support `var` components", n)
-        
-        let castedValue = quote do: cast[ptr UncheckedArray[`seqType`]](`cquery`[static(find(`carh`, typeid(`varType`)))][].data)[][`idx`]
+
         let nameN = n[0]
-        if hasDefaultValue:
-          let orTypes = collectOrTypes(queryPart)
-          if orTypes.len > 1:
-            var chainExpr = defaultValue
-            for i in countdown(orTypes.high, 0):
-              let t = orTypes[i]
-              let prevChain = chainExpr
-              chainExpr = quote do:
-                (if queryHas_impl(`cquery`, `carh`, typeid(`t`)): cast[ptr UncheckedArray[`seqType`]](`cquery`[static(find(`carh`, typeid(`t`)))][].data)[][`idx`] else: `prevChain`)
-            outVars[name] = quoteWithoutLineInfo do:
-              let `nameN`: `varType` = `chainExpr`
-          else:
-            outVars[name] = quoteWithoutLineInfo do:
-              let `nameN`: `varType` =
-                if has(`varType`):
-                  cast[ptr UncheckedArray[`seqType`]](`cquery`[static(find(`carh`, typeid(`varType`)))][].data)[][`idx`]
-                else:
-                  `defaultValue`
+        let orTypes = collectOrTypes(queryPart)
+
+        if orTypes.len > 1:
+          ## union query: the bound value is of the FIRST listed type.
+          ## an entity that instead has one of the other listed types
+          ## gets that component implicitly converted to the first type (via converters).
+          ## the matched archetype is guaranteed to have at least one of the listed types,
+          ## but not necessarily a given one - so each column is read only when present
+          ## (reading an absent column's nil data pointer would crash).
+          if varType.kind == nnkVarTy:
+            error("union component bindings do not support `var` components", n)
+          let firstType = orTypes[0]
+          var chainExpr =
+            if hasDefaultValue: defaultValue
+            else: quote do: default(`firstType`)
+          for i in countdown(orTypes.high, 0):
+            let t = orTypes[i]
+            let prevChain = chainExpr
+            chainExpr = quote do:
+              (if queryHas_impl(`cquery`, `carh`, typeid(`t`)):
+                block:
+                  # `let` with an explicit type triggers the implicit converter
+                  # from `t` to `firstType` (identity when `t` is `firstType`)
+                  let converted {.used.}: `firstType` =
+                    cast[ptr UncheckedArray[`t`]](`cquery`[static(find(`carh`, typeid(`t`)))][].data)[][`idx`]
+                  converted
+              else: `prevChain`)
+          outVars[name] = quoteWithoutLineInfo do:
+            let `nameN`: `firstType` = `chainExpr`
+
+        elif hasDefaultValue:
+          outVars[name] = quoteWithoutLineInfo do:
+            let `nameN`: `varType` =
+              if has(`varType`):
+                cast[ptr UncheckedArray[`seqType`]](`cquery`[static(find(`carh`, typeid(`varType`)))][].data)[][`idx`]
+              else:
+                `defaultValue`
         else:
+          let castedValue = quote do: cast[ptr UncheckedArray[`seqType`]](`cquery`[static(find(`carh`, typeid(`varType`)))][].data)[][`idx`]
           outVars[name] = quote do:
             template `nameN`: `varType` = `castedValue`
     
