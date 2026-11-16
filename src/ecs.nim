@@ -601,9 +601,10 @@ macro componentRecordConstructorFromSym(x: typed): ComponentRecord =
     nnkExprColonExpr.newTree(
       ident("trace"), (quote do:
         proc(rec: ptr ComponentRecord, env: pointer) {.nimcall.} =
+          let srcArr = cast[ptr UncheckedArray[`typ`]](rec.data)
           var i = 0
           while i < rec.len:
-            doTraceElem(cast[ptr `typ`](cast[int](rec.data) + i * sizeof(`typ`))[], env)
+            doTraceElem(srcArr[][i], env)
             inc i
       )
     ),
@@ -611,9 +612,10 @@ macro componentRecordConstructorFromSym(x: typed): ComponentRecord =
     nnkExprColonExpr.newTree(
       ident("destroy"), (quote do:
         proc(rec: ptr ComponentRecord) {.nimcall.} =
+          let srcArr = cast[ptr UncheckedArray[`typ`]](rec.data)
           var i = 0
           while i < rec.len:
-            doDestroyElem(cast[ptr `typ`](cast[int](rec.data) + i * sizeof(`typ`))[])
+            doDestroyElem(srcArr[][i])
             inc i
           if rec.data != nil: dealloc(rec.data)
           rec.data = nil; rec.len = 0; rec.cap = 0
