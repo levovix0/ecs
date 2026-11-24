@@ -667,7 +667,7 @@ macro componentRecordConstructorFromSym(x: typed): ComponentRecord =
   )
 
 
-proc add*[T](wc: var ComponentRecord, val: T) =
+proc addToRecord*[T](wc: var ComponentRecord, val: T) =
   compRecEnsureCap(wc.addr, wc.len + 1)
   cast[ptr T](cast[int](wc.data) + wc.len * sizeof(T))[] = val
   wc.len += 1
@@ -709,7 +709,7 @@ proc genAssignComponents(w: NimNode, types: seq[NimNode], values: seq[NimNode], 
           ),
           newLit(orderRemap[i])
         ),
-        ident("add")
+        bindSym("addToRecord")
       ),
       (
         if typ.kind in {nnkSym, nnkIdent} and typ.strVal.eqIdent("EntityId"):
@@ -874,7 +874,7 @@ proc clone*(w: World, entity: EntityId): EntityId =
     generation: eidSlot.generation,
   )
 
-  arcRec[].components[0].add(newEntityId)
+  arcRec[].components[0].addToRecord(newEntityId)
   for i in 1..<arcRec[].components.len:
     callCopy(arcRec[].components[i].addr, compIdx, arcRec[].components[i].addr)
 
@@ -914,7 +914,7 @@ proc teleportClone*(dest, src: World, entity: EntityId): EntityId =
     generation: eidSlot.generation,
   )
 
-  destArc[].components[0].add(newEntityId)
+  destArc[].components[0].addToRecord(newEntityId)
   for i in 1..<srcArc[].components.len:
     callCopy(srcArc[].components[i].addr, srcCompIdx, destArc[].components[i].addr)
 
@@ -1094,7 +1094,7 @@ proc setOrInsertComponent[T](ar: var ArchetypeRecord, idx: int, tid: TypeId, val
 
   let comp = ar.components[i].addr
   if comp.len == idx:
-    comp[].add value
+    comp[].addToRecord(value)
   elif idx < comp.len:
     cast[ptr UncheckedArray[T]](comp.data)[][idx] = value
   else:
